@@ -117,7 +117,7 @@ class DiffBertEmbeddings(nn.Module):
         repeated_tensor = timesteps.unsqueeze(1).repeat(1, n_seq)
 
         time_embeddings = self.time_embedding(repeated_tensor)
-        embeddings = self.word_embeddings(inputs_embeds)
+        embeddings = inputs_embeds#self.word_embeddings(inputs_embeds)
 
         embeddings = embeddings + time_embeddings + token_type_embeddings
         if self.position_embedding_type == "absolute":
@@ -818,7 +818,7 @@ class DiffBertModel(DiffBertPreTrainedModel):
 
 @add_start_docstrings("""DiffBert Model with a `language modeling` head on top.""")
 class DiffBertForDiffusion(DiffBertPreTrainedModel):
-    _tied_weights_keys = ["predictions.decoder.bias", "cls.predictions.decoder.weight"]
+    _tied_weights_keys = []
 
     def __init__(self, config):
         super().__init__(config)
@@ -830,13 +830,13 @@ class DiffBertForDiffusion(DiffBertPreTrainedModel):
             )
 
         self.bert = DiffBertModel(config, add_pooling_layer=False)
-        self.cls = nn.Linear(config.hidden_size, config.vocab_size)
+        self.cls = nn.Linear(config.hidden_size, config.hidden_size)
 
         # Initialize weights and apply final processing
         # self.post_init()
 
     def get_output_embeddings(self):
-        return self.cls#.predictions.decoder
+        return #.predictions.decoder
 
     def set_output_embeddings(self, new_embeddings):
         return

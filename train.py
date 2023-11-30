@@ -105,7 +105,7 @@ def parse_args():
     parser.add_argument(
         "--text_column",
         type=str,
-        default="text",
+        default="Prompt",
         help="The column of the dataset containing a caption or a list of captions.",
     )
     parser.add_argument(
@@ -161,9 +161,9 @@ def parse_args():
         help="whether to randomly flip images horizontally",
     )
     parser.add_argument(
-        "--train_batch_size", type=int, default=1, help="Batch size (per device) for the training dataloader."
+        "--train_batch_size", type=int, default=64, help="Batch size (per device) for the training dataloader."
     )
-    parser.add_argument("--num_train_epochs", type=int, default=100)
+    parser.add_argument("--num_train_epochs", type=int, default=30)
     parser.add_argument(
         "--max_train_steps",
         type=int,
@@ -173,7 +173,7 @@ def parse_args():
     parser.add_argument(
         "--gradient_accumulation_steps",
         type=int,
-        default=1,
+        default=8,
         help="Number of updates steps to accumulate before performing a backward/update pass.",
     )
     parser.add_argument(
@@ -208,7 +208,7 @@ def parse_args():
     parser.add_argument(
         "--snr_gamma",
         type=float,
-        default=None,
+        default=5,
         help="SNR weighting gamma to be used if rebalancing the loss. Recommended value is 5.0. "
         "More details here: https://arxiv.org/abs/2303.09556.",
     )
@@ -402,6 +402,9 @@ def main():
         args.pretrained_model_name_or_path
     )
 
+    embedding = torch.nn.Embedding(unet.config.vocab_size, unet.config.hidden_size)
+    embedding.load_state_dict(torch.load(args.pretrained_model_name_or_path+'/embedding_weights.bin'))
+
     # Freeze vae and text_encoder and set unet to trainable
     unet.train()
 
@@ -510,12 +513,14 @@ def main():
     else:
         text_column = args.text_column
         if text_column not in column_names:
+            print(text_column, column_names)
             raise ValueError(
                 f"--text_column' value '{args.text_column}' needs to be one of: {', '.join(column_names)}"
             )
 
     # Preprocessing the datasets.
     # We need to tokenize input captions and transform the images.
+
     def tokenize_captions(examples, is_train=True):
         captions = []
         for caption in examples[text_column]:
@@ -528,21 +533,22 @@ def main():
                 raise ValueError(
                     f"Caption column `{text_column}` should contain either strings or lists of strings."
                 )
-        print(captions)
+        # print(captions)
         inputs = tokenizer(
-            captions, max_length=tokenizer.model_max_length, padding="max_length", truncation=True, return_tensors="pt"
+            captions, max_length=64, padding="max_length", truncation=True, return_tensors="pt"
         )
         return inputs.input_ids
 
-    def id_to_one_hot(token_ids, vocab_size=tokenizer.vocab_size):
-        one_hot_vectors = []
-        for token_id in token_ids:
-            # Create a zero-filled array with length equal to vocab_size
-            one_hot = torch.zeros(vocab_size)
-            # Set the value at the index of the token ID to 1
-            one_hot[token_id] = 1
-            one_hot_vectors.append(one_hot)
-        return torch.stack(one_hot_vectors, dim=0)
+    def id_to_one_hot(token_ids, vocab_size=unet.config.vocab_size):
+        # one_hot_vectors = []
+        # for token_id in token_ids:
+        #     # Create a zero-filled array with length equal to vocab_size
+        #     one_hot = torch.zeros(vocab_size)
+        #     # Set the value at the index of the token ID to 1
+        #     one_hot[token_id] = 1
+        #     one_hot_vectors.append(one_hot)
+        vectors = embedding(token_ids.to(embedding.weight.device))
+        return vectors#torch.stack(one_hot_vectors, dim=0)
 
     def preprocess_train(examples):
         examples["input_ids"] = tokenize_captions(examples)
@@ -591,8 +597,8 @@ def main():
     )
 
     # Prepare everything with our `accelerator`.
-    unet, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-        unet, optimizer, train_dataloader, lr_scheduler
+    unet, embedding, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+        unet, embedding, optimizer, train_dataloader, lr_scheduler
     )
 
     if args.use_ema:
@@ -717,9 +723,16 @@ def main():
                     raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
 
                 # Predict the noise residual and compute loss
-                model_pred = unet(noisy_latents, timesteps).sample
+                model_pred = unet(noisy_latents, timesteps).logits
 
                 if args.snr_gamma is None:
+                    # Get the indices of the maximum value along the last dimension
+                    # target_indices = torch.argmax(target, dim=-1).view(-1)
+
+                    # # target_one_hot = F.one_hot(target_indices.long(), num_classes=unet.config.vocab_size)
+                    # # target_one_hot_flat = target_indices.view(-1, unet.config.vocab_size)
+                    # loss = torch.nn.CrossEntropyLoss()
+                    # loss = loss(model_pred.float().view(-1, unet.config.vocab_size), target_indices.view(-1))
                     loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
                 else:
                     # Compute loss-weights as per Section 3.4 of https://arxiv.org/abs/2303.09556.
@@ -733,6 +746,7 @@ def main():
                         torch.stack([snr, args.snr_gamma * torch.ones_like(timesteps)], dim=1).min(dim=1)[0] / snr
                     )
 
+                    
                     loss = F.mse_loss(model_pred.float(), target.float(), reduction="none")
                     loss = loss.mean(dim=list(range(1, len(loss.shape)))) * mse_loss_weights
                     loss = loss.mean()
@@ -758,31 +772,31 @@ def main():
                 accelerator.log({"train_loss": train_loss}, step=global_step)
                 train_loss = 0.0
 
-                if global_step % args.checkpointing_steps == 0:
-                    if accelerator.is_main_process:
-                        # _before_ saving state, check if this save would set us over the `checkpoints_total_limit`
-                        if args.checkpoints_total_limit is not None:
-                            checkpoints = os.listdir(args.output_dir)
-                            checkpoints = [d for d in checkpoints if d.startswith("checkpoint")]
-                            checkpoints = sorted(checkpoints, key=lambda x: int(x.split("-")[1]))
+                # if global_step % args.checkpointing_steps == 0:
+                #     if accelerator.is_main_process:
+                #         # _before_ saving state, check if this save would set us over the `checkpoints_total_limit`
+                #         if args.checkpoints_total_limit is not None:
+                #             checkpoints = os.listdir(args.output_dir)
+                #             checkpoints = [d for d in checkpoints if d.startswith("checkpoint")]
+                #             checkpoints = sorted(checkpoints, key=lambda x: int(x.split("-")[1]))
 
-                            # before we save the new checkpoint, we need to have at _most_ `checkpoints_total_limit - 1` checkpoints
-                            if len(checkpoints) >= args.checkpoints_total_limit:
-                                num_to_remove = len(checkpoints) - args.checkpoints_total_limit + 1
-                                removing_checkpoints = checkpoints[0:num_to_remove]
+                #             # before we save the new checkpoint, we need to have at _most_ `checkpoints_total_limit - 1` checkpoints
+                #             if len(checkpoints) >= args.checkpoints_total_limit:
+                #                 num_to_remove = len(checkpoints) - args.checkpoints_total_limit + 1
+                #                 removing_checkpoints = checkpoints[0:num_to_remove]
 
-                                logger.info(
-                                    f"{len(checkpoints)} checkpoints already exist, removing {len(removing_checkpoints)} checkpoints"
-                                )
-                                logger.info(f"removing checkpoints: {', '.join(removing_checkpoints)}")
+                #                 logger.info(
+                #                     f"{len(checkpoints)} checkpoints already exist, removing {len(removing_checkpoints)} checkpoints"
+                #                 )
+                #                 logger.info(f"removing checkpoints: {', '.join(removing_checkpoints)}")
 
-                                for removing_checkpoint in removing_checkpoints:
-                                    removing_checkpoint = os.path.join(args.output_dir, removing_checkpoint)
-                                    shutil.rmtree(removing_checkpoint)
+                #                 for removing_checkpoint in removing_checkpoints:
+                #                     removing_checkpoint = os.path.join(args.output_dir, removing_checkpoint)
+                #                     shutil.rmtree(removing_checkpoint)
 
-                        save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
-                        accelerator.save_state(save_path)
-                        logger.info(f"Saved state to {save_path}")
+                #         save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
+                #         accelerator.save_state(save_path)
+                #         logger.info(f"Saved state to {save_path}")
 
             logs = {"step_loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
             progress_bar.set_postfix(**logs)

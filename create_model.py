@@ -4,7 +4,7 @@ from diffusers import DDIMScheduler
 
 
 
-config = DiffBertConfig(hidden_size=384, num_hidden_layers=2, intermediate_size=768)
+config = DiffBertConfig(hidden_size=768, num_hidden_layers=2, intermediate_size=768, vocab_size=29794)
 
 model = DiffBertForDiffusion(config)
 tokenizer = AutoTokenizer.from_pretrained("neuralmind/bert-base-portuguese-cased")
