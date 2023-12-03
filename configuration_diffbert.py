@@ -114,6 +114,7 @@ class DiffBertConfig(PretrainedConfig):
         pad_token_id=0,
         position_embedding_type="absolute",
         use_cache=True,
+        rotary_value=False,
         classifier_dropout=None,
         **kwargs,
     ):
@@ -134,6 +135,7 @@ class DiffBertConfig(PretrainedConfig):
         self.layer_norm_eps = layer_norm_eps
         self.position_embedding_type = position_embedding_type
         self.use_cache = use_cache
+        self.rotary_value = rotary_value
         self.classifier_dropout = classifier_dropout
 
 

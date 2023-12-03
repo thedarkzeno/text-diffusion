@@ -37,10 +37,10 @@ from huggingface_hub import create_repo, upload_folder
 from packaging import version
 from torchvision import transforms
 from tqdm.auto import tqdm
-from transformers import AutoTokenizer, BertModel
+from transformers import AutoTokenizer
 
 from transformers.utils import ContextManagers
-from modeling_diffbert import DiffBertForDiffusion
+from modeling_diffbert_sample import DiffBertForDiffusion
 
 import diffusers
 from diffusers import DDPMScheduler
@@ -48,7 +48,6 @@ from diffusers.optimization import get_scheduler
 from diffusers.training_utils import EMAModel, compute_snr
 from diffusers.utils import deprecate, is_wandb_available, make_image_grid
 
-from torchvision.transforms import CenterCrop, ConvertImageDtype, Normalize, Resize
 
 if is_wandb_available():
     import wandb
@@ -107,7 +106,7 @@ def parse_args():
     parser.add_argument(
         "--text_column",
         type=str,
-        default="Prompt",
+        default="article",
         help="The column of the dataset containing a caption or a list of captions.",
     )
     parser.add_argument(
@@ -139,29 +138,6 @@ def parse_args():
         help="The directory where the downloaded models and datasets will be stored.",
     )
     parser.add_argument("--seed", type=int, default=None, help="A seed for reproducible training.")
-    parser.add_argument(
-        "--resolution",
-        type=int,
-        default=512,
-        help=(
-            "The resolution for input images, all the images in the train/validation dataset will be resized to this"
-            " resolution"
-        ),
-    )
-    parser.add_argument(
-        "--center_crop",
-        default=False,
-        action="store_true",
-        help=(
-            "Whether to center crop the input images to the resolution. If not set, the images will be randomly"
-            " cropped. The images will be resized to the resolution first before cropping."
-        ),
-    )
-    parser.add_argument(
-        "--random_flip",
-        action="store_true",
-        help="whether to randomly flip images horizontally",
-    )
     parser.add_argument(
         "--train_batch_size", type=int, default=64, help="Batch size (per device) for the training dataloader."
     )
@@ -275,7 +251,7 @@ def parse_args():
     parser.add_argument(
         "--mixed_precision",
         type=str,
-        default=None,
+        default="bf16",
         choices=["no", "fp16", "bf16"],
         help=(
             "Whether to use mixed precision. Choose between fp16 and bf16 (bfloat16). Bf16 requires PyTorch >="
@@ -286,7 +262,7 @@ def parse_args():
     parser.add_argument(
         "--report_to",
         type=str,
-        default="tensorboard",
+        default="wandb",
         help=(
             'The integration to report the results and logs to. Supported platforms are `"tensorboard"`'
             ' (default), `"wandb"` and `"comet_ml"`. Use `"all"` to report to all integrations.'
@@ -327,7 +303,7 @@ def parse_args():
     parser.add_argument(
         "--tracker_project_name",
         type=str,
-        default="text2image-fine-tune",
+        default="text-diffusion",
         help=(
             "The `project_name` argument passed to Accelerator.init_trackers for"
             " more information see https://huggingface.co/docs/accelerate/v0.17.0/en/package_reference/accelerator#accelerate.Accelerator"
@@ -400,25 +376,20 @@ def main():
         args.pretrained_model_name_or_path, revision=args.revision
     )
 
-    unet = DiffBertForDiffusion.from_pretrained(
+    model = DiffBertForDiffusion.from_pretrained(
         args.pretrained_model_name_or_path
     )
 
-    # embedding = torch.nn.Embedding(unet.config.vocab_size, unet.config.hidden_size)
-    # embedding.load_state_dict(torch.load(args.pretrained_model_name_or_path+'/embedding_weights.bin'))
-    embedding = BertModel.from_pretrained("neuralmind/bert-base-portuguese-cased")
+    # Freeze vae and text_encoder and set model to trainable
+    model.train()
 
-    # Freeze vae and text_encoder and set unet to trainable
-    unet.train()
-    embedding.requires_grad_(False)
-    embedding.eval()
 
-    # Create EMA for the unet.
+    # Create EMA for the model.
     if args.use_ema:
-        ema_unet = DiffBertForDiffusion.from_pretrained(
+        ema_model = DiffBertForDiffusion.from_pretrained(
             args.pretrained_model_name_or_path
         )
-        ema_unet = EMAModel(ema_unet.parameters(), model_cls=DiffBertForDiffusion, model_config=ema_unet.config)
+        ema_model = EMAModel(ema_model.parameters(), model_cls=DiffBertForDiffusion, model_config=ema_model.config)
 
 
 
@@ -428,19 +399,19 @@ def main():
         def save_model_hook(models, weights, output_dir):
             if accelerator.is_main_process:
                 if args.use_ema:
-                    ema_unet.save_pretrained(os.path.join(output_dir, "unet_ema"))
+                    ema_model.save_pretrained(os.path.join(output_dir, "model_ema"))
 
                 for i, model in enumerate(models):
-                    model.save_pretrained(os.path.join(output_dir, "unet"))
+                    model.save_pretrained(os.path.join(output_dir, "model"))
 
                     # make sure to pop weight so that corresponding model is not saved again
                     weights.pop()
 
         def load_model_hook(models, input_dir):
             if args.use_ema:
-                load_model = EMAModel.from_pretrained(os.path.join(input_dir, "unet_ema"), DiffBertForDiffusion)
-                ema_unet.load_state_dict(load_model.state_dict())
-                ema_unet.to(accelerator.device)
+                load_model = EMAModel.from_pretrained(os.path.join(input_dir, "model_ema"), DiffBertForDiffusion)
+                ema_model.load_state_dict(load_model.state_dict())
+                ema_model.to(accelerator.device)
                 del load_model
 
             for i in range(len(models)):
@@ -448,7 +419,7 @@ def main():
                 model = models.pop()
 
                 # load diffusers style into model
-                load_model = DiffBertForDiffusion.from_pretrained(input_dir, subfolder="unet")
+                load_model = DiffBertForDiffusion.from_pretrained(input_dir, subfolder="model")
                 model.register_to_config(**load_model.config)
 
                 model.load_state_dict(load_model.state_dict())
@@ -458,7 +429,7 @@ def main():
         accelerator.register_load_state_pre_hook(load_model_hook)
 
     if args.gradient_checkpointing:
-        unet.enable_gradient_checkpointing()
+        model.enable_gradient_checkpointing()
 
     # Enable TF32 for faster training on Ampere GPUs,
     # cf https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices
@@ -484,7 +455,7 @@ def main():
         optimizer_cls = torch.optim.AdamW
 
     optimizer = optimizer_cls(
-        unet.parameters(),
+        model.parameters(),
         lr=args.learning_rate,
         betas=(args.adam_beta1, args.adam_beta2),
         weight_decay=args.adam_weight_decay,
@@ -540,28 +511,17 @@ def main():
                 )
         # print(captions)
         inputs = tokenizer(
-            captions, max_length=64, padding="max_length", truncation=True, return_tensors="pt"
+            captions, max_length=128, padding="max_length", truncation=True, return_tensors="pt"
         )
         return inputs.input_ids
 
 
     
-    def id_to_one_hot(token_ids, vocab_size=unet.config.vocab_size):
-        # one_hot_vectors = []
-        # for token_id in token_ids:
-        #     # Create a zero-filled array with length equal to vocab_size
-        #     one_hot = torch.zeros(vocab_size)
-        #     # Set the value at the index of the token ID to 1
-        #     one_hot[token_id] = 1
-        #     one_hot_vectors.append(one_hot)
-        # print(token_ids.shape)
-        vectors = embedding(token_ids.to(embedding.device)).last_hidden_state
-        # shape = vectors.shape
-        # print(vectors.shape)
-        # vectors = vectors.reshape(shape[1], shape[2])
-        # vectors = 2*vectors - 1
-        # vectors = vector_transformations(vectors)
-        return vectors#torch.stack(one_hot_vectors, dim=0)
+    def apply_embeddings(token_ids):
+
+        vectors = model.apply_embeddings(input_ids=token_ids.to(model.device))
+
+        return vectors
 
     def preprocess_train(examples):
         examples["input_ids"] = tokenize_captions(examples)
@@ -575,17 +535,11 @@ def main():
 
     def collate_fn(examples):
         input_ids = torch.stack([example["input_ids"] for example in examples])
-        # one_hots = torch.stack([id_to_one_hot(example["input_ids"]) for example in examples])
-        one_hots = id_to_one_hot(input_ids)
-        return {"input_ids": input_ids, "one_hots": one_hots}
+        # one_hots = torch.stack([apply_embeddings(example["input_ids"]) for example in examples])
+        # one_hots = apply_embeddings(input_ids)
+        return {"input_ids": input_ids}
     
-    def add_noise(latents, max_steps=noise_scheduler.config.num_train_timesteps):
-        noise = torch.randn_like(latents)
-        bsz = latents.shape[0]
-        timesteps = torch.randint(0, max_steps, (bsz,), device=latents.device)
-        timesteps = timesteps.long()
-        noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
-        return noisy_latents, noise, timesteps
+
     
     # DataLoaders creation:
     train_dataloader = torch.utils.data.DataLoader(
@@ -611,14 +565,14 @@ def main():
     )
 
     # Prepare everything with our `accelerator`.
-    unet, embedding, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-        unet, embedding, optimizer, train_dataloader, lr_scheduler
+    model, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+        model, optimizer, train_dataloader, lr_scheduler
     )
 
     if args.use_ema:
-        ema_unet.to(accelerator.device)
+        ema_model.to(accelerator.device)
 
-    # For mixed precision training we cast all non-trainable weigths (vae, non-lora text_encoder and non-lora unet) to half-precision
+    # For mixed precision training we cast all non-trainable weigths (vae, non-lora text_encoder and non-lora model) to half-precision
     # as these weights are only used for inference, keeping weights in full precision is not required.
     weight_dtype = torch.float32
     if accelerator.mixed_precision == "fp16":
@@ -643,6 +597,16 @@ def main():
         tracker_config.pop("validation_prompts")
         accelerator.init_trackers(args.tracker_project_name, tracker_config)
 
+
+    class MeanZeroLoss(torch.nn.Module):
+        def __init__(self):
+            super(MeanZeroLoss, self).__init__()
+
+        def forward(self, input_tensor):
+            mean_value = torch.mean(input_tensor)
+            loss = torch.abs(mean_value)  # Penalize the absolute deviation from zero
+            return loss
+    
     # Train!
     total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
 
@@ -656,6 +620,7 @@ def main():
     global_step = 0
     first_epoch = 0
 
+    mean_zero_loss_function = MeanZeroLoss()
     # Potentially load in the weights and states from a previous save
     if args.resume_from_checkpoint:
         if args.resume_from_checkpoint != "latest":
@@ -695,34 +660,25 @@ def main():
     for epoch in range(first_epoch, args.num_train_epochs):
         train_loss = 0.0
         for step, batch in enumerate(train_dataloader):
-            with accelerator.accumulate(unet):
+            with accelerator.accumulate(model):
                 # Convert images to latent space
-                latents = batch["one_hots"].to(weight_dtype)
+                input_ids = batch["input_ids"].to(model.device)
+
+                max_steps = noise_scheduler.config.num_train_timesteps
+                bsz = input_ids.shape[0]
+                timesteps = torch.randint(0, max_steps, (bsz,), device=model.device)
+                timesteps = timesteps.long()
+
+                latents = apply_embeddings(input_ids)
                 # print(latents.shape)
                 
-
-                # # Sample noise that we'll add to the latents
-                # noise = torch.randn_like(latents)
-                # if args.noise_offset:
-                #     # https://www.crosslabs.org//blog/diffusion-with-offset-noise
-                #     noise += args.noise_offset * torch.randn(
-                #         (latents.shape[0], latents.shape[1], 1, 1), device=latents.device
-                #     )
-                # if args.input_perturbation:
-                #     new_noise = noise + args.input_perturbation * torch.randn_like(noise)
-                # bsz = latents.shape[0]
-                # # Sample a random timestep for each image
-                # timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device)
-                # timesteps = timesteps.long()
-
-                # # Add noise to the latents according to the noise magnitude at each timestep
-                # # (this is the forward diffusion process)
-                # if args.input_perturbation:
-                #     noisy_latents = noise_scheduler.add_noise(latents, new_noise, timesteps)
-                # else:
-                #     noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
+                noise = torch.randn_like(latents, requires_grad=False)
                 
-                noisy_latents, noise, timesteps = add_noise(latents)
+                
+                noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
+
+
+                # noisy_latents, noise, timesteps = add_noise(latents)
 
 
                 # Get the target for loss depending on the prediction type
@@ -732,23 +688,34 @@ def main():
 
                 if noise_scheduler.config.prediction_type == "epsilon":
                     target = noise
+                elif noise_scheduler.config.prediction_type == "sample":
+                    target = latents
                 elif noise_scheduler.config.prediction_type == "v_prediction":
                     target = noise_scheduler.get_velocity(latents, noise, timesteps)
                 else:
                     raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
 
                 # Predict the noise residual and compute loss
-                model_pred = unet(noisy_latents, timesteps).logits
+                outputs = model(noisy_latents, timesteps=timesteps, labels=input_ids)
+                nll_loss=outputs.loss
+                model_pred = outputs.last_hidden_state
+
+                ae_out = model.apply_lm_head(latents, labels=input_ids)
+
+                ae_loss = ae_out.loss
+
 
                 if args.snr_gamma is None:
                     # Get the indices of the maximum value along the last dimension
                     # target_indices = torch.argmax(target, dim=-1).view(-1)
 
-                    # # target_one_hot = F.one_hot(target_indices.long(), num_classes=unet.config.vocab_size)
-                    # # target_one_hot_flat = target_indices.view(-1, unet.config.vocab_size)
+                    # # target_one_hot = F.one_hot(target_indices.long(), num_classes=model.config.vocab_size)
+                    # # target_one_hot_flat = target_indices.view(-1, model.config.vocab_size)
                     # loss = torch.nn.CrossEntropyLoss()
-                    # loss = loss(model_pred.float().view(-1, unet.config.vocab_size), target_indices.view(-1))
-                    loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+                    # loss = loss(model_pred.float().view(-1, model.config.vocab_size), target_indices.view(-1))
+                    mse_loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+                    mean_zero_loss = mean_zero_loss_function(model_pred.float())
+                    loss = nll_loss + mse_loss + mean_zero_loss + ae_loss
                 else:
                     # Compute loss-weights as per Section 3.4 of https://arxiv.org/abs/2303.09556.
                     # Since we predict the noise instead of x_0, the original formulation is slightly changed.
@@ -762,9 +729,11 @@ def main():
                     )
 
                     
-                    loss = F.mse_loss(model_pred.float(), target.float(), reduction="none")
-                    loss = loss.mean(dim=list(range(1, len(loss.shape)))) * mse_loss_weights
-                    loss = loss.mean()
+                    mse_loss = F.mse_loss(model_pred.float(), target.float(), reduction="none")
+                    mse_loss = mse_loss.mean(dim=list(range(1, len(mse_loss.shape)))) * mse_loss_weights
+                    mse_loss = mse_loss.mean()
+                    mean_zero_loss = mean_zero_loss_function(model_pred.float())
+                    loss = nll_loss + mse_loss + mean_zero_loss + ae_loss
 
                 # Gather the losses across all processes for logging (if we use distributed training).
                 avg_loss = accelerator.gather(loss.repeat(args.train_batch_size)).mean()
@@ -773,7 +742,7 @@ def main():
                 # Backpropagate
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
-                    accelerator.clip_grad_norm_(unet.parameters(), args.max_grad_norm)
+                    accelerator.clip_grad_norm_(model.parameters(), args.max_grad_norm)
                 optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad()
@@ -781,7 +750,7 @@ def main():
             # Checks if the accelerator has performed an optimization step behind the scenes
             if accelerator.sync_gradients:
                 if args.use_ema:
-                    ema_unet.step(unet.parameters())
+                    ema_model.step(model.parameters())
                 progress_bar.update(1)
                 global_step += 1
                 accelerator.log({"train_loss": train_loss}, step=global_step)
@@ -789,37 +758,19 @@ def main():
 
                 if global_step % args.checkpointing_steps == 0:
                     if accelerator.is_main_process:
-                        unet = accelerator.unwrap_model(unet)
+                        model = accelerator.unwrap_model(model)
                         if args.use_ema:
-                            ema_unet.copy_to(unet.parameters())
+                            ema_model.copy_to(model.parameters())
 
-                        unet.save_pretrained(args.output_dir)
-                #     if accelerator.is_main_process:
-                #         # _before_ saving state, check if this save would set us over the `checkpoints_total_limit`
-                #         if args.checkpoints_total_limit is not None:
-                #             checkpoints = os.listdir(args.output_dir)
-                #             checkpoints = [d for d in checkpoints if d.startswith("checkpoint")]
-                #             checkpoints = sorted(checkpoints, key=lambda x: int(x.split("-")[1]))
+                        model.save_pretrained(args.output_dir)
 
-                #             # before we save the new checkpoint, we need to have at _most_ `checkpoints_total_limit - 1` checkpoints
-                #             if len(checkpoints) >= args.checkpoints_total_limit:
-                #                 num_to_remove = len(checkpoints) - args.checkpoints_total_limit + 1
-                #                 removing_checkpoints = checkpoints[0:num_to_remove]
 
-                #                 logger.info(
-                #                     f"{len(checkpoints)} checkpoints already exist, removing {len(removing_checkpoints)} checkpoints"
-                #                 )
-                #                 logger.info(f"removing checkpoints: {', '.join(removing_checkpoints)}")
-
-                #                 for removing_checkpoint in removing_checkpoints:
-                #                     removing_checkpoint = os.path.join(args.output_dir, removing_checkpoint)
-                #                     shutil.rmtree(removing_checkpoint)
-
-                #         save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
-                #         accelerator.save_state(save_path)
-                #         logger.info(f"Saved state to {save_path}")
-
-            logs = {"step_loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
+            logs = {"loss": loss.detach().item(), 
+                    "mse_loss": mse_loss.detach().item(), 
+                    "nll_loss": nll_loss.detach().item(), 
+                    "mz_loss": mean_zero_loss.detach().item(), 
+                    "ae_loss": ae_loss.detach().item(), 
+                    "lr": lr_scheduler.get_last_lr()[0]}
             progress_bar.set_postfix(**logs)
 
             if global_step >= args.max_train_steps:
@@ -830,11 +781,11 @@ def main():
     # Create the pipeline using the trained modules and save it.
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
-        unet = accelerator.unwrap_model(unet)
+        model = accelerator.unwrap_model(model)
         if args.use_ema:
-            ema_unet.copy_to(unet.parameters())
+            ema_model.copy_to(model.parameters())
 
-        unet.save_pretrained(args.output_dir)
+        model.save_pretrained(args.output_dir)
 
     accelerator.end_training()
 

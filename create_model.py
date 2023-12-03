@@ -1,15 +1,16 @@
-from modeling_diffbert import DiffBertForDiffusion, DiffBertConfig
+from modeling_diffbert_sample import DiffBertForDiffusion, DiffBertConfig
 from transformers import AutoTokenizer
 from diffusers import DDIMScheduler
 
 
+tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
 
-config = DiffBertConfig(hidden_size=384, num_hidden_layers=2, intermediate_size=768)
+
+scheduler = DDIMScheduler(prediction_type="sample", num_train_timesteps = 2000)
+config = DiffBertConfig(hidden_size=768, num_hidden_layers=6, intermediate_size=768, vocab_size=tokenizer.vocab_size, timesteps=2000)
 
 model = DiffBertForDiffusion(config)
-tokenizer = AutoTokenizer.from_pretrained("neuralmind/bert-base-portuguese-cased")
-scheduler = DDIMScheduler()
 
-model.save_pretrained("diffbert-mini")
-tokenizer.save_pretrained("diffbert-mini")
-scheduler.save_pretrained("diffbert-mini")
+model.save_pretrained("diffbert-mini-sample")
+tokenizer.save_pretrained("diffbert-mini-sample")
+scheduler.save_pretrained("diffbert-mini-sample")
