@@ -24,3 +24,7 @@ sh train.sh
 ## Usage
 
 You can generate and play with the model with the provided jupyter notebook `generate sample.ipynb`
+
+## Usage
+
+This repository was built ontop of code from [minimal-text-diffusion](https://github.com/madaan/minimal-text-diffusion), [diffusers](https://github.com/huggingface/diffusers) and [transformers](https://github.com/huggingface/transformers)
