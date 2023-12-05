@@ -49,7 +49,7 @@ from transformers.utils import (
     logging,
     replace_return_docstrings,
 )
-from configuration_diffbert import DiffBertConfig
+from src.configuration_diffbert import DiffBertConfig
 
 
 logger = logging.get_logger(__name__)

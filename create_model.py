@@ -1,5 +1,5 @@
 # from modeling_diffbert_sample import DiffBertForDiffusion, DiffBertConfig
-from modeling_diffllama import DiffLlamaForDiffusionLM, DiffLlamaConfig
+from src.modeling_diffllama import DiffLlamaForDiffusionLM, DiffLlamaConfig
 from transformers import AutoTokenizer
 from diffusers import DDIMScheduler
 import torch

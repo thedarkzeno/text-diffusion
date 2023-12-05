@@ -44,7 +44,7 @@ from transformers.utils import (
     replace_return_docstrings,
 )
 from transformers.utils.import_utils import is_torch_fx_available
-from configuration_diffllama import DiffLlamaConfig
+from src.configuration_diffllama import DiffLlamaConfig
 
 
 if is_flash_attn_2_available():

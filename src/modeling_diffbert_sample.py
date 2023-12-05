@@ -51,7 +51,7 @@ from transformers.utils import (
     is_flash_attn_2_available,
     replace_return_docstrings,
 )
-from configuration_diffbert import DiffBertConfig
+from src.configuration_diffbert import DiffBertConfig
 import numpy as np
 
 if is_flash_attn_2_available():

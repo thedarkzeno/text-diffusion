@@ -40,7 +40,7 @@ from tqdm.auto import tqdm
 from transformers import AutoTokenizer
 
 from transformers.utils import ContextManagers
-from modeling_diffllama import DiffLlamaForDiffusionLM
+from src.modeling_diffllama import DiffLlamaForDiffusionLM
 
 import diffusers
 from diffusers import DDPMScheduler
@@ -746,13 +746,6 @@ def main():
 
 
                 if args.snr_gamma is None:
-                    # Get the indices of the maximum value along the last dimension
-                    # target_indices = torch.argmax(target, dim=-1).view(-1)
-
-                    # # target_one_hot = F.one_hot(target_indices.long(), num_classes=model.config.vocab_size)
-                    # # target_one_hot_flat = target_indices.view(-1, model.config.vocab_size)
-                    # loss = torch.nn.CrossEntropyLoss()
-                    # loss = loss(model_pred.float().view(-1, model.config.vocab_size), target_indices.view(-1))
                     mse_loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
                     # mean_zero_loss = mean_zero_loss_function(model_pred.float())
 
