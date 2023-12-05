@@ -1,1 +1,1 @@
-python3 train_sample.py --pretrained_model_name_or_path="./diffbert-mini-sample" --dataset_name="cnn_dailymail" --dataset_config_name="3.0.0" --output_dir="diffbert-mini-sample-trained" 
+python3 train_sample.py --pretrained_model_name_or_path="./diffllama-mini-sample" --dataset_name="Gustavosta/Stable-Diffusion-Prompts"  --output_dir="diffllama-mini-sample-trained" 

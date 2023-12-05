@@ -54,12 +54,12 @@ from transformers.utils import (
 from configuration_diffbert import DiffBertConfig
 import numpy as np
 
+if is_flash_attn_2_available():
+    from flash_attn import flash_attn_func, flash_attn_varlen_func
+    from flash_attn.bert_padding import index_first_axis, pad_input, unpad_input  # noqa
+
 logger = logging.get_logger(__name__)
 
-
-
-
-# Copied from transformers.models.llama.modeling_llama._get_unpad_data
 def _get_unpad_data(attention_mask):
     seqlens_in_batch = attention_mask.sum(dim=-1, dtype=torch.int32)
     indices = torch.nonzero(attention_mask.flatten(), as_tuple=False).flatten()
@@ -71,6 +71,42 @@ def _get_unpad_data(attention_mask):
         max_seqlen_in_batch,
     )
 
+def timestep_embedding(timesteps, dim, max_period=10000):
+    """
+    Create sinusoidal timestep embeddings.
+
+    :param timesteps: a 1-D Tensor of N indices, one per batch element.
+                      These may be fractional.
+    :param dim: the dimension of the output.
+    :param max_period: controls the minimum frequency of the embeddings.
+    :return: an [N x dim] Tensor of positional embeddings.
+    """
+    half = dim // 2
+    freqs = torch.exp(
+        -math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32) / half
+    ).to(device=timesteps.device)
+    args = timesteps[:, None].float() * freqs[None]
+    embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+    if dim % 2:
+        embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
+    return embedding
+
+class RMSNorm(nn.Module):
+    def __init__(self, hidden_size, eps=1e-6):
+        """
+        RMSNorm is equivalent to T5LayerNorm
+        """
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.variance_epsilon = eps
+
+    def forward(self, hidden_states):
+        input_dtype = hidden_states.dtype
+        hidden_states = hidden_states.to(torch.float32)
+        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+        return self.weight * hidden_states.to(input_dtype)
+    
 @dataclass
 class DiffusionLMOutput(ModelOutput):
     """
@@ -138,21 +174,21 @@ class DiffBertEmbeddings(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.word_embeddings = nn.Embedding(config.vocab_size, config.hidden_size, padding_idx=config.pad_token_id)
-        self.position_embeddings = nn.Embedding(config.max_position_embeddings, config.hidden_size)
-        self.token_type_embeddings = nn.Embedding(config.type_vocab_size, config.hidden_size)
+        # self.position_embeddings = nn.Embedding(config.max_position_embeddings, config.hidden_size)
+        # self.token_type_embeddings = nn.Embedding(config.type_vocab_size, config.hidden_size)
         
-        # self.LayerNorm is not snake-cased to stick with TensorFlow model variable name and be able to load
+        # self.RMSNorm is not snake-cased to stick with TensorFlow model variable name and be able to load
         # any TensorFlow checkpoint file
-        self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
-        self.dropout = nn.Dropout(config.hidden_dropout_prob)
-        # position_ids (1, len position emb) is contiguous in memory and exported when serialized
-        self.position_embedding_type = getattr(config, "position_embedding_type", "absolute")
-        self.register_buffer(
-            "position_ids", torch.arange(config.max_position_embeddings).expand((1, -1)), persistent=False
-        )
-        self.register_buffer(
-            "token_type_ids", torch.zeros(self.position_ids.size(), dtype=torch.long), persistent=False
-        )
+        # self.RMSNorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        # self.dropout = nn.Dropout(config.hidden_dropout_prob)
+        # # position_ids (1, len position emb) is contiguous in memory and exported when serialized
+        # self.position_embedding_type = getattr(config, "position_embedding_type", "absolute")
+        # self.register_buffer(
+        #     "position_ids", torch.arange(config.max_position_embeddings).expand((1, -1)), persistent=False
+        # )
+        # self.register_buffer(
+        #     "token_type_ids", torch.zeros(self.position_ids.size(), dtype=torch.long), persistent=False
+        # )
 
     def apply_position(self, input_ids: torch.LongTensor, past_key_values_length: int = 0):
         input_shape = input_ids.size()
@@ -169,45 +205,46 @@ class DiffBertEmbeddings(nn.Module):
         input_embeds: Optional[torch.FloatTensor] = None,
         past_key_values_length: int = 0,
     ) -> torch.Tensor:
-        if input_ids is not None:
-            input_shape = input_ids.size()
-        else:
-            input_shape = input_embeds.size()[:-1]
+        # if input_ids is not None:
+        #     input_shape = input_ids.size()
+        # else:
+        #     input_shape = input_embeds.size()[:-1]
 
-        seq_length = input_shape[1]
+        # seq_length = input_shape[1]
 
-        if position_ids is None:
-            position_ids = self.position_ids[:, past_key_values_length : seq_length + past_key_values_length]
+        # if position_ids is None:
+        #     position_ids = self.position_ids[:, past_key_values_length : seq_length + past_key_values_length]
 
-        # Setting the token_type_ids to the registered buffer in constructor where it is all zeros, which usually occurs
-        # when its auto-generated, registered buffer helps users when tracing the model without passing token_type_ids, solves
-        # issue #5664
-        if token_type_ids is None:
-            if hasattr(self, "token_type_ids"):
-                buffered_token_type_ids = self.token_type_ids[:, :seq_length]
-                buffered_token_type_ids_expanded = buffered_token_type_ids.expand(input_shape[0], seq_length)
-                token_type_ids = buffered_token_type_ids_expanded
-            else:
-                token_type_ids = torch.zeros(input_shape, dtype=torch.long, device=self.position_ids.device)
+        # # Setting the token_type_ids to the registered buffer in constructor where it is all zeros, which usually occurs
+        # # when its auto-generated, registered buffer helps users when tracing the model without passing token_type_ids, solves
+        # # issue #5664
+        # if token_type_ids is None:
+        #     if hasattr(self, "token_type_ids"):
+        #         buffered_token_type_ids = self.token_type_ids[:, :seq_length]
+        #         buffered_token_type_ids_expanded = buffered_token_type_ids.expand(input_shape[0], seq_length)
+        #         token_type_ids = buffered_token_type_ids_expanded
+        #     else:
+        #         token_type_ids = torch.zeros(input_shape, dtype=torch.long, device=self.position_ids.device)
 
         if input_embeds is None:
             input_embeds = self.word_embeddings(input_ids)
-        token_type_embeddings = self.token_type_embeddings(token_type_ids)
+        # token_type_embeddings = self.token_type_embeddings(token_type_ids)
 
         
 
-        embeddings = input_embeds + token_type_embeddings# + time_embeddings
-        if self.position_embedding_type == "absolute":
-            position_embeddings = self.position_embeddings(position_ids)
-            embeddings += position_embeddings
-        embeddings = self.LayerNorm(embeddings)
-        embeddings = self.dropout(embeddings)
-        return embeddings
+        # embeddings = input_embeds + token_type_embeddings# + time_embeddings
+        # if self.position_embedding_type == "absolute":
+        #     position_embeddings = self.position_embeddings(position_ids)
+        #     embeddings += position_embeddings
+        # embeddings = self.RMSNorm(embeddings)
+        # embeddings = self.dropout(embeddings)
+        return input_embeds
 
 
 class DiffBertSelfAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
+        self.config=config
         if config.hidden_size % config.num_attention_heads != 0 and not hasattr(config, "embedding_size"):
             raise ValueError(
                 f"The hidden size ({config.hidden_size}) is not a multiple of the number of attention "
@@ -218,9 +255,9 @@ class DiffBertSelfAttention(nn.Module):
         self.attention_head_size = int(config.hidden_size / config.num_attention_heads)
         self.all_head_size = self.num_attention_heads * self.attention_head_size
 
-        self.query = nn.Linear(config.hidden_size, self.all_head_size)
-        self.key = nn.Linear(config.hidden_size, self.all_head_size)
-        self.value = nn.Linear(config.hidden_size, self.all_head_size)
+        self.query = nn.Linear(config.hidden_size, self.all_head_size, bias=False)
+        self.key = nn.Linear(config.hidden_size, self.all_head_size, bias=False)
+        self.value = nn.Linear(config.hidden_size, self.all_head_size, bias=False)
 
         self.dropout = nn.Dropout(config.attention_probs_dropout_prob)
 
@@ -342,25 +379,156 @@ class DiffBertSelfAttention(nn.Module):
             return query_layer, key_layer, value_layer
         return query_layer, key_layer
 
+# class DiffBertSelfFlashAttention2(DiffBertSelfAttention):
+#     def transpose_for_scores(self, x: torch.Tensor) -> torch.Tensor:
+#         new_x_shape = x.size()[:-1] + (self.num_attention_heads, self.attention_head_size)
+#         x = x.view(new_x_shape)
+#         return x
+    
+#     def forward(
+#         self,
+#         hidden_states: torch.Tensor,
+#         attention_mask: Optional[torch.FloatTensor] = None,
+#         sinusoidal_pos=None,
+#         head_mask: Optional[torch.FloatTensor] = None,
+#         encoder_hidden_states: Optional[torch.FloatTensor] = None,
+#         encoder_attention_mask: Optional[torch.FloatTensor] = None,
+#         past_key_value: Optional[Tuple[Tuple[torch.FloatTensor]]] = None,
+#         output_attentions: Optional[bool] = False,
+#     ) -> Tuple[torch.Tensor]:
+        
+#         mixed_query_layer = self.query(hidden_states)
+#         batch_size, query_length, hidden_size = mixed_query_layer.shape
+        
+#         is_cross_attention = encoder_hidden_states is not None
 
+#         if is_cross_attention and past_key_value is not None:
+#             # reuse k,v, cross_attentions
+#             key_layer = past_key_value[0]
+#             value_layer = past_key_value[1]
+#             attention_mask = encoder_attention_mask
+#         elif is_cross_attention:
+#             key_layer = self.transpose_for_scores(self.key(encoder_hidden_states))
+#             value_layer = self.transpose_for_scores(self.value(encoder_hidden_states))
+#             attention_mask = encoder_attention_mask
+#         elif past_key_value is not None:
+#             key_layer = self.transpose_for_scores(self.key(hidden_states))
+#             value_layer = self.transpose_for_scores(self.value(hidden_states))
+#             key_layer = torch.cat([past_key_value[0], key_layer], dim=2)
+#             value_layer = torch.cat([past_key_value[1], value_layer], dim=2)
+#         else:
+#             key_layer = self.transpose_for_scores(self.key(hidden_states))
+#             value_layer = self.transpose_for_scores(self.value(hidden_states))
+
+#         query_layer = self.transpose_for_scores(mixed_query_layer)
+
+#         use_cache = past_key_value is not None
+#         if self.is_decoder:
+#             past_key_value = (key_layer, value_layer)
+        
+#         if attention_mask is None:
+#             attention_scores = flash_attn_func(
+#                 query_layer, key_layer, value_layer, self.dropout.p, softmax_scale=None, causal=self.is_decoder
+#             )
+#         else:
+#             query_states, key_states, value_states, indices_q, cu_seq_lens, max_seq_lens = self._upad_input(
+#                 query_layer, key_layer, value_layer, attention_mask, query_length
+#             )
+            
+#             cu_seqlens_q, cu_seqlens_k = cu_seq_lens
+#             max_seqlen_in_batch_q, max_seqlen_in_batch_k = max_seq_lens
+            
+#             attn_output_unpad = flash_attn_varlen_func(
+#                 query_states,
+#                 key_states,
+#                 value_states,
+#                 cu_seqlens_q=cu_seqlens_q,
+#                 cu_seqlens_k=cu_seqlens_k,
+#                 max_seqlen_q=max_seqlen_in_batch_q,
+#                 max_seqlen_k=max_seqlen_in_batch_k,
+#                 dropout_p=self.dropout.p,
+#                 softmax_scale=None,
+#                 causal=self.is_decoder,
+#             )
+            
+#             attn_output = pad_input(attn_output_unpad, indices_q, batch_size, query_length)
+        
+#         attn_output = attn_output.reshape(batch_size, query_length, hidden_size).contiguous()
+        
+#         if output_attentions:
+#             raise NotImplementedError("output_attentions is not implemented")
+        
+#         outputs = (attn_output, None)
+#         if self.is_decoder:
+#             outputs = outputs + (past_key_value,)
+#         return outputs
+            
+        
+#     def _upad_input(self, query_layer, key_layer, value_layer, attention_mask, query_length):
+#         # print(attention_mask)
+#         # if attention_mask == None:
+#         #     shape = query_layer.shape
+#         attention_mask = torch.ones_like(attention_mask).to(query_layer.device)
+#         indices_k, cu_seqlens_k, max_seqlen_in_batch_k = _get_unpad_data(attention_mask)
+#         print(cu_seqlens_k, cu_seqlens_k)
+#         batch_size, kv_seq_len, num_key_value_heads, head_dim = key_layer.shape
+
+#         key_layer = index_first_axis(
+#             key_layer.reshape(batch_size * kv_seq_len, num_key_value_heads, head_dim), indices_k
+#         )
+#         value_layer = index_first_axis(
+#             value_layer.reshape(batch_size * kv_seq_len, num_key_value_heads, head_dim), indices_k
+#         )
+#         if query_length == kv_seq_len:
+#             query_layer = index_first_axis(
+#                 query_layer.reshape(batch_size * kv_seq_len, self.num_attention_heads, head_dim), indices_k
+#             )
+#             cu_seqlens_q = cu_seqlens_k
+#             max_seqlen_in_batch_q = max_seqlen_in_batch_k
+#             indices_q = indices_k
+#         elif query_length == 1:
+#             max_seqlen_in_batch_q = 1
+#             cu_seqlens_q = torch.arange(
+#                 batch_size + 1, dtype=torch.int32, device=query_layer.device
+#             )  # There is a memcpy here, that is very bad.
+#             indices_q = cu_seqlens_q[:-1]
+#             query_layer = query_layer.squeeze(1)
+#         else:
+#             # The -q_len: slice assumes left padding.
+#             attention_mask = attention_mask[:, -query_length:]
+#             query_layer, indices_q, cu_seqlens_q, max_seqlen_in_batch_q = unpad_input(query_layer, attention_mask)
+
+#         return (
+#             query_layer,
+#             key_layer,
+#             value_layer,
+#             indices_q,
+#             (cu_seqlens_q, cu_seqlens_k),
+#             (max_seqlen_in_batch_q, max_seqlen_in_batch_k),
+#         )
 
 class DiffBertSelfOutput(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.dense = nn.Linear(config.hidden_size, config.hidden_size)
-        self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        self.dense = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
+        self.RMSNorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
 
     def forward(self, hidden_states: torch.Tensor, input_tensor: torch.Tensor) -> torch.Tensor:
         hidden_states = self.dense(hidden_states)
         hidden_states = self.dropout(hidden_states)
-        hidden_states = self.LayerNorm(hidden_states + input_tensor)
+        hidden_states = self.RMSNorm(hidden_states + input_tensor)
         return hidden_states
 
 
 class DiffBertAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
+        # self.self = (
+        #     DiffBertSelfAttention(config)
+        #     if not getattr(config, "_flash_attn_2_enabled", False)
+        #     else DiffBertSelfFlashAttention2(config)
+        # )#DiffBertSelfAttention(config)
         self.self = DiffBertSelfAttention(config)
         self.output = DiffBertSelfOutput(config)
         self.pruned_heads = set()
@@ -414,29 +582,29 @@ class DiffBertAttention(nn.Module):
 class DiffBertIntermediate(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.dense = nn.Linear(config.hidden_size, config.intermediate_size)
-        if isinstance(config.hidden_act, str):
-            self.intermediate_act_fn = ACT2FN[config.hidden_act]
-        else:
-            self.intermediate_act_fn = config.hidden_act
+        self.config = config
+        self.gate_proj = nn.Linear(self.config.hidden_size, self.config.intermediate_size, bias=False)
+        self.up_proj = nn.Linear(self.config.hidden_size, self.config.intermediate_size, bias=False)
+        self.down_proj = nn.Linear(self.config.intermediate_size, self.config.hidden_size, bias=False)
+        self.act_fn = ACT2FN[config.hidden_act]
+
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        hidden_states = self.dense(hidden_states)
-        hidden_states = self.intermediate_act_fn(hidden_states)
+        hidden_states = self.down_proj(self.act_fn(self.gate_proj(hidden_states)) * self.up_proj(hidden_states))
         return hidden_states
 
 
 class DiffBertOutput(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.dense = nn.Linear(config.intermediate_size, config.hidden_size)
-        self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        self.dense = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
+        self.RMSNorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
 
     def forward(self, hidden_states: torch.Tensor, input_tensor: torch.Tensor) -> torch.Tensor:
         hidden_states = self.dense(hidden_states)
         hidden_states = self.dropout(hidden_states)
-        hidden_states = self.LayerNorm(hidden_states + input_tensor)
+        hidden_states = self.RMSNorm(hidden_states + input_tensor)
         return hidden_states
 
 
@@ -630,7 +798,7 @@ class DiffBertEncoder(nn.Module):
 class DiffBertPooler(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.dense = nn.Linear(config.hidden_size, config.hidden_size)
+        self.dense = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
         self.activation = nn.Tanh()
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -645,17 +813,17 @@ class DiffBertPooler(nn.Module):
 class DiffBertPredictionHeadTransform(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.dense = nn.Linear(config.hidden_size, config.hidden_size)
+        self.dense = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
         if isinstance(config.hidden_act, str):
             self.transform_act_fn = ACT2FN[config.hidden_act]
         else:
             self.transform_act_fn = config.hidden_act
-        self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        self.RMSNorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         hidden_states = self.dense(hidden_states)
         hidden_states = self.transform_act_fn(hidden_states)
-        hidden_states = self.LayerNorm(hidden_states)
+        hidden_states = self.RMSNorm(hidden_states)
         return hidden_states
 
 
@@ -692,7 +860,7 @@ class DiffBertOnlyMLMHead(nn.Module):
 class DiffBertOnlyNSPHead(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.seq_relationship = nn.Linear(config.hidden_size, 2)
+        self.seq_relationship = nn.Linear(config.hidden_size, 2, bias=False)
 
     def forward(self, pooled_output):
         seq_relationship_score = self.seq_relationship(pooled_output)
@@ -703,7 +871,7 @@ class DiffBertPreTrainingHeads(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.predictions = DiffBertLMPredictionHead(config)
-        self.seq_relationship = nn.Linear(config.hidden_size, 2)
+        self.seq_relationship = nn.Linear(config.hidden_size, 2, bias=False)
 
     def forward(self, sequence_output, pooled_output):
         prediction_scores = self.predictions(sequence_output)
@@ -733,7 +901,7 @@ class DiffBertPreTrainedModel(PreTrainedModel):
         #     module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
         #     if module.padding_idx is not None:
         #         module.weight.data[module.padding_idx].zero_()
-        # elif isinstance(module, nn.LayerNorm):
+        # elif isinstance(module, RMSNorm):
         #     module.bias.data.zero_()
         #     module.weight.data.fill_(1.0)
         return
@@ -762,13 +930,22 @@ class DiffBertModel(DiffBertPreTrainedModel):
         self.embeddings = DiffBertEmbeddings(config)
         #added position + timesteps
         # self.position_embeddings = nn.Embedding(config.max_position_embeddings, config.hidden_size)
-        self.time_embedding = nn.Embedding(config.timesteps, config.hidden_size)
+        self.input_proj = nn.Sequential(
+                nn.Linear(config.hidden_size, config.hidden_size),
+                nn.Tanh(),
+                nn.Linear(config.hidden_size, config.hidden_size),
+            )
+        self.time_embedding = nn.Sequential(
+            nn.Linear(config.hidden_size, config.hidden_size//2, bias=False),
+            nn.SiLU(),
+            nn.Linear(config.hidden_size//2, config.hidden_size, bias=False),
+        )#nn.Embedding(config.timesteps, config.hidden_size)
 
         # self.position_embedding_type = getattr(config, "position_embedding_type", "absolute")
         # self.register_buffer(
         #     "position_ids", torch.arange(config.max_position_embeddings).expand((1, -1)), persistent=False
         # )
-        self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        self.RMSNorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.encoder = DiffBertEncoder(config)
 
         self.pooler = DiffBertPooler(config) if add_pooling_layer else None
@@ -891,15 +1068,18 @@ class DiffBertModel(DiffBertPreTrainedModel):
         #     past_key_values_length=past_key_values_length,
         # )
         n_seq = input_embeds.size(1)
-        repeated_tensor = timesteps.unsqueeze(1).repeat(1, n_seq)
+        # repeated_tensor = timesteps.unsqueeze(1).repeat(1, n_seq)
         # if position_ids is None:
         # position_ids = self.position_ids[:, past_key_values_length : seq_length + past_key_values_length]
         # position_embeddings = self.position_embeddings(position_ids)
         # embeddings += position_embeddings
-        time_embeddings = self.time_embedding(repeated_tensor)
-
+        # time_embeddings = self.time_embedding(repeated_tensor)
+        input_embeds = self.input_proj(input_embeds)
+        time_embeddings = timestep_embedding(timesteps, self.config.hidden_size).unsqueeze(1).repeat(1, n_seq, 1)
+        time_embeddings = self.time_embedding(time_embeddings.to(input_embeds.dtype))
         input_embeds += time_embeddings #+ position_embeddings
-        # input_embeds = self.LayerNorm(input_embeds)
+        input_embeds = self.RMSNorm(input_embeds)
+
         encoder_outputs = self.encoder(
             input_embeds,
             attention_mask=extended_attention_mask,
@@ -943,7 +1123,13 @@ class DiffBertForDiffusion(DiffBertPreTrainedModel):
             )
 
         self.bert = DiffBertModel(config, add_pooling_layer=False)
-        self.cls = nn.Linear(config.hidden_size, config.vocab_size)
+
+        self.out_proj = nn.Sequential(
+            nn.Linear(config.hidden_size, config.hidden_size, bias=False),
+            nn.Tanh(),
+            nn.Linear(config.hidden_size, config.hidden_size, bias=False)
+        )
+        self.cls = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
         # Initialize weights and apply final processing
         # self.post_init()
@@ -1019,6 +1205,7 @@ class DiffBertForDiffusion(DiffBertPreTrainedModel):
         )
 
         sequence_output = outputs[0]
+        sequence_output = self.out_proj(sequence_output)
         # print(sequence_output.shape)
         prediction_scores = self.cls(sequence_output)
 
@@ -1034,7 +1221,7 @@ class DiffBertForDiffusion(DiffBertPreTrainedModel):
         return DiffusionLMOutput(
             loss=masked_lm_loss,
             logits=prediction_scores,
-            last_hidden_state=outputs.last_hidden_state,
+            last_hidden_state=sequence_output,
             attentions=outputs.attentions,
         )
 

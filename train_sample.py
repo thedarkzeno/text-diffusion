@@ -40,7 +40,7 @@ from tqdm.auto import tqdm
 from transformers import AutoTokenizer
 
 from transformers.utils import ContextManagers
-from modeling_diffbert_sample import DiffBertForDiffusion
+from modeling_diffllama import DiffLlamaForDiffusionLM
 
 import diffusers
 from diffusers import DDPMScheduler
@@ -106,7 +106,7 @@ def parse_args():
     parser.add_argument(
         "--text_column",
         type=str,
-        default="article",
+        default="Prompt",
         help="The column of the dataset containing a caption or a list of captions.",
     )
     parser.add_argument(
@@ -139,7 +139,7 @@ def parse_args():
     )
     parser.add_argument("--seed", type=int, default=None, help="A seed for reproducible training.")
     parser.add_argument(
-        "--train_batch_size", type=int, default=64, help="Batch size (per device) for the training dataloader."
+        "--train_batch_size", type=int, default=16, help="Batch size (per device) for the training dataloader."
     )
     parser.add_argument("--num_train_epochs", type=int, default=1000)
     parser.add_argument(
@@ -151,7 +151,7 @@ def parse_args():
     parser.add_argument(
         "--gradient_accumulation_steps",
         type=int,
-        default=8,
+        default=32,
         help="Number of updates steps to accumulate before performing a backward/update pass.",
     )
     parser.add_argument(
@@ -196,6 +196,7 @@ def parse_args():
     parser.add_argument(
         "--allow_tf32",
         action="store_true",
+        default=False,
         help=(
             "Whether or not to allow TF32 on Ampere GPUs. Can be used to speed up training. For more information, see"
             " https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices"
@@ -325,6 +326,39 @@ def parse_args():
 
     return args
 
+def mean_flat(tensor):
+    """
+    Take the mean over all non-batch dimensions.
+    """
+    return tensor.mean(dim=list(range(1, len(tensor.shape))))
+
+def _extract_into_tensor(arr, timesteps, broadcast_shape):
+    """
+    Extract values from a 1-D numpy array for a batch of indices.
+
+    :param arr: the 1-D numpy array.
+    :param timesteps: a tensor of indices into the array to extract.
+    :param broadcast_shape: a larger shape of K dimensions with the batch
+                            dimension equal to the length of timesteps.
+    :return: a tensor of shape [batch_size, 1, ...] where the shape has K dims.
+    """
+    res = arr.to(device=timesteps.device)[timesteps].float()
+    while len(res.shape) < len(broadcast_shape):
+        res = res[..., None]
+    return res.expand(broadcast_shape)
+
+def q_mean_variance(x_start, t, scheduler):
+        """
+        Get the distribution q(x_t | x_0).
+
+        :param x_start: the [N x C x ...] tensor of noiseless inputs.
+        :param t: the number of diffusion steps (minus 1). Here, 0 means one step.
+        :return: A tuple (mean, variance, log_variance), all of x_start's shape.
+        """
+        sqrt_alphas_cumprod = np.sqrt(scheduler.alphas_cumprod)
+        mean = _extract_into_tensor(sqrt_alphas_cumprod, t, x_start.shape) * x_start
+
+        return mean
 
 def main():
     args = parse_args()
@@ -376,8 +410,10 @@ def main():
         args.pretrained_model_name_or_path, revision=args.revision
     )
 
-    model = DiffBertForDiffusion.from_pretrained(
-        args.pretrained_model_name_or_path
+    model = DiffLlamaForDiffusionLM.from_pretrained(
+        args.pretrained_model_name_or_path,
+        use_flash_attention_2=True,
+        torch_dtype=torch.bfloat16
     )
 
     # Freeze vae and text_encoder and set model to trainable
@@ -386,12 +422,16 @@ def main():
 
     # Create EMA for the model.
     if args.use_ema:
-        ema_model = DiffBertForDiffusion.from_pretrained(
+        ema_model = DiffLlamaForDiffusionLM.from_pretrained(
             args.pretrained_model_name_or_path
         )
-        ema_model = EMAModel(ema_model.parameters(), model_cls=DiffBertForDiffusion, model_config=ema_model.config)
+        ema_model = EMAModel(ema_model.parameters(), model_cls=DiffLlamaForDiffusionLM, model_config=ema_model.config)
 
+    tokenizer.add_special_tokens({'pad_token': '<pad>'})
 
+    embedding_size = model.get_input_embeddings().weight.shape[0]
+    if len(tokenizer) > embedding_size:
+        model.resize_token_embeddings(len(tokenizer))
 
     # `accelerate` 0.16.0 will have better support for customized saving
     if version.parse(accelerate.__version__) >= version.parse("0.16.0"):
@@ -409,7 +449,7 @@ def main():
 
         def load_model_hook(models, input_dir):
             if args.use_ema:
-                load_model = EMAModel.from_pretrained(os.path.join(input_dir, "model_ema"), DiffBertForDiffusion)
+                load_model = EMAModel.from_pretrained(os.path.join(input_dir, "model_ema"), DiffLlamaForDiffusionLM)
                 ema_model.load_state_dict(load_model.state_dict())
                 ema_model.to(accelerator.device)
                 del load_model
@@ -419,7 +459,7 @@ def main():
                 model = models.pop()
 
                 # load diffusers style into model
-                load_model = DiffBertForDiffusion.from_pretrained(input_dir, subfolder="model")
+                load_model = DiffLlamaForDiffusionLM.from_pretrained(input_dir, subfolder="model")
                 model.register_to_config(**load_model.config)
 
                 model.load_state_dict(load_model.state_dict())
@@ -511,7 +551,7 @@ def main():
                 )
         # print(captions)
         inputs = tokenizer(
-            captions, max_length=128, padding="max_length", truncation=True, return_tensors="pt"
+            captions, max_length=64, padding="max_length", truncation=True, return_tensors="pt"
         )
         return inputs.input_ids
 
@@ -714,8 +754,17 @@ def main():
                     # loss = torch.nn.CrossEntropyLoss()
                     # loss = loss(model_pred.float().view(-1, model.config.vocab_size), target_indices.view(-1))
                     mse_loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
-                    mean_zero_loss = mean_zero_loss_function(model_pred.float())
-                    loss = nll_loss + mse_loss + mean_zero_loss + ae_loss
+                    # mean_zero_loss = mean_zero_loss_function(model_pred.float())
+
+                    # out_mean = q_mean_variance(
+                    #     model_pred, torch.LongTensor([max_steps - 1]).to(model_pred.device), noise_scheduler
+                    # )
+                    # tT_loss = mean_flat(out_mean**2).mean()
+                    # print(tT_loss)
+                    if step < 100:
+                        loss = ae_loss
+                    else:
+                        loss = nll_loss + mse_loss + ae_loss# + tT_loss
                 else:
                     # Compute loss-weights as per Section 3.4 of https://arxiv.org/abs/2303.09556.
                     # Since we predict the noise instead of x_0, the original formulation is slightly changed.
@@ -732,8 +781,11 @@ def main():
                     mse_loss = F.mse_loss(model_pred.float(), target.float(), reduction="none")
                     mse_loss = mse_loss.mean(dim=list(range(1, len(mse_loss.shape)))) * mse_loss_weights
                     mse_loss = mse_loss.mean()
-                    mean_zero_loss = mean_zero_loss_function(model_pred.float())
-                    loss = nll_loss + mse_loss + mean_zero_loss + ae_loss
+                    # mean_zero_loss = mean_zero_loss_function(model_pred.float())
+                    if step < 100:
+                        loss = ae_loss
+                    else:
+                        loss = nll_loss + mse_loss + ae_loss
 
                 # Gather the losses across all processes for logging (if we use distributed training).
                 avg_loss = accelerator.gather(loss.repeat(args.train_batch_size)).mean()
@@ -768,7 +820,7 @@ def main():
             logs = {"loss": loss.detach().item(), 
                     "mse_loss": mse_loss.detach().item(), 
                     "nll_loss": nll_loss.detach().item(), 
-                    "mz_loss": mean_zero_loss.detach().item(), 
+                    # "mz_loss": mean_zero_loss.detach().item(), 
                     "ae_loss": ae_loss.detach().item(), 
                     "lr": lr_scheduler.get_last_lr()[0]}
             progress_bar.set_postfix(**logs)
