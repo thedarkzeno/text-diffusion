@@ -3,6 +3,7 @@
 
 This repository contains an implementation of a Denoising Diffusion Probabilistic Model of Text (DDPT) based on Transformer networks. This model aims to generate high-quality, coherent text by utilizing diffusion-based probabilistic modeling techniques within a transformer architecture.
 
+| ![diffusion](./generation.gif) |
 
 ## Setup
 
