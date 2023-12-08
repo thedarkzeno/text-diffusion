@@ -28,10 +28,10 @@ logger = logging.get_logger(__name__)
 LLAMA_PRETRAINED_CONFIG_ARCHIVE_MAP = {}
 
 
-class DiffLlamaConfig(PretrainedConfig):
+class DiffMambaConfig(PretrainedConfig):
     
 
-    model_type = "diffllama"
+    model_type = "diffmamba"
     keys_to_ignore_at_inference = ["past_key_values"]
 
     def __init__(

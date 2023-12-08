@@ -22,6 +22,7 @@ import math
 import warnings
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Union
+from functools import partial
 
 import torch
 import torch.nn.functional as F
@@ -44,13 +45,13 @@ from transformers.utils import (
     replace_return_docstrings,
 )
 from transformers.utils.import_utils import is_torch_fx_available
-from src.configuration_diffllama import DiffLlamaConfig
+from src.configuration_diffmamba import DiffMambaConfig
+from mamba_ssm.modules.mamba_simple import Mamba, Block
 
-
-if is_flash_attn_2_available():
-    from flash_attn import flash_attn_func, flash_attn_varlen_func
-    from flash_attn.bert_padding import index_first_axis, pad_input, unpad_input  # noqa
-
+try:
+    from mamba_ssm.ops.triton.layernorm import RMSNorm, layer_norm_fn, rms_norm_fn
+except ImportError:
+    RMSNorm, layer_norm_fn, rms_norm_fn = None, None, None
 
 # This makes `_prepare_4d_causal_attention_mask` a leaf function in the FX graph.
 # It means that the function will not be traced through and simply appear as a node in the graph.
@@ -63,7 +64,7 @@ if is_flash_attn_2_available():
 
 logger = logging.get_logger(__name__)
 
-_CONFIG_FOR_DOC = "DiffLlamaConfig"
+_CONFIG_FOR_DOC = "DiffMambaConfig"
 
 
 def _get_unpad_data(attention_mask):
@@ -121,10 +122,10 @@ class DiffusionLMOutput(ModelOutput):
     last_hidden_state: Optional[Tuple[torch.FloatTensor]] = None
 
 
-class DiffLlamaRMSNorm(nn.Module):
+class DiffMambaRMSNorm(nn.Module):
     def __init__(self, hidden_size, eps=1e-6):
         """
-        DiffLlamaRMSNorm is equivalent to T5LayerNorm
+        DiffMambaRMSNorm is equivalent to T5LayerNorm
         """
         super().__init__()
         self.weight = nn.Parameter(torch.ones(hidden_size))
@@ -138,10 +139,10 @@ class DiffLlamaRMSNorm(nn.Module):
         return self.weight * hidden_states.to(input_dtype)
 
 
-# ALL_LAYERNORM_LAYERS.append(DiffLlamaRMSNorm)
+# ALL_LAYERNORM_LAYERS.append(DiffMambaRMSNorm)
 
 
-class DiffLlamaRotaryEmbedding(nn.Module):
+class DiffMambaRotaryEmbedding(nn.Module):
     def __init__(self, dim, max_position_embeddings=2048, base=10000, device=None):
         super().__init__()
 
@@ -177,8 +178,8 @@ class DiffLlamaRotaryEmbedding(nn.Module):
         )
 
 
-class DiffLlamaLinearScalingRotaryEmbedding(DiffLlamaRotaryEmbedding):
-    """DiffLlamaRotaryEmbedding extended with linear scaling. Credits to the Reddit user /u/kaiokendev"""
+class DiffMambaLinearScalingRotaryEmbedding(DiffMambaRotaryEmbedding):
+    """DiffMambaRotaryEmbedding extended with linear scaling. Credits to the Reddit user /u/kaiokendev"""
 
     def __init__(self, dim, max_position_embeddings=2048, base=10000, device=None, scaling_factor=1.0):
         self.scaling_factor = scaling_factor
@@ -196,8 +197,8 @@ class DiffLlamaLinearScalingRotaryEmbedding(DiffLlamaRotaryEmbedding):
         self.register_buffer("sin_cached", emb.sin().to(dtype), persistent=False)
 
 
-class DiffLlamaDynamicNTKScalingRotaryEmbedding(DiffLlamaRotaryEmbedding):
-    """DiffLlamaRotaryEmbedding extended with Dynamic NTK scaling. Credits to the Reddit users /u/bloc97 and /u/emozilla"""
+class DiffMambaDynamicNTKScalingRotaryEmbedding(DiffMambaRotaryEmbedding):
+    """DiffMambaRotaryEmbedding extended with Dynamic NTK scaling. Credits to the Reddit users /u/bloc97 and /u/emozilla"""
 
     def __init__(self, dim, max_position_embeddings=2048, base=10000, device=None, scaling_factor=1.0):
         self.scaling_factor = scaling_factor
@@ -257,7 +258,7 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids, unsqueeze_dim=1):
     return q_embed, k_embed
 
 
-class DiffLlamaMLP(nn.Module):
+class DiffMambaMLP(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
@@ -303,10 +304,10 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
 
 
-class DiffLlamaAttention(nn.Module):
+class DiffMambaAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
-    def __init__(self, config: DiffLlamaConfig):
+    def __init__(self, config: DiffMambaConfig):
         super().__init__()
         self.config = config
         self.attention_dropout = config.attention_dropout
@@ -333,7 +334,7 @@ class DiffLlamaAttention(nn.Module):
 
     def _init_rope(self):
         if self.config.rope_scaling is None:
-            self.rotary_emb = DiffLlamaRotaryEmbedding(
+            self.rotary_emb = DiffMambaRotaryEmbedding(
                 self.head_dim,
                 max_position_embeddings=self.max_position_embeddings,
                 base=self.rope_theta,
@@ -342,14 +343,14 @@ class DiffLlamaAttention(nn.Module):
             scaling_type = self.config.rope_scaling["type"]
             scaling_factor = self.config.rope_scaling["factor"]
             if scaling_type == "linear":
-                self.rotary_emb = DiffLlamaLinearScalingRotaryEmbedding(
+                self.rotary_emb = DiffMambaLinearScalingRotaryEmbedding(
                     self.head_dim,
                     max_position_embeddings=self.max_position_embeddings,
                     scaling_factor=scaling_factor,
                     base=self.rope_theta,
                 )
             elif scaling_type == "dynamic":
-                self.rotary_emb = DiffLlamaDynamicNTKScalingRotaryEmbedding(
+                self.rotary_emb = DiffMambaDynamicNTKScalingRotaryEmbedding(
                     self.head_dim,
                     max_position_embeddings=self.max_position_embeddings,
                     scaling_factor=scaling_factor,
@@ -463,224 +464,17 @@ class DiffLlamaAttention(nn.Module):
         return attn_output, attn_weights, past_key_value
 
 
-class DiffLlamaFlashAttention2(DiffLlamaAttention):
-    """
-    DiffLlama flash attention module. This module inherits from `DiffLlamaAttention` as the weights of the module stays
-    untouched. The only required change would be on the forward pass where it needs to correctly call the public API of
-    flash attention and deal with padding tokens in case the input contains any of them.
-    """
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-
-        # TODO: Should be removed once Flash Attention for RoCm is bumped to 2.1.
-        # flash_attn<2.1 generates top-left aligned causal mask, while what is needed here is bottom-right alignement, that was made default for flash_attn>=2.1. This attribute is used to handle this difference. Reference: https://github.com/Dao-AILab/flash-attention/releases/tag/v2.1.0.
-        # Beware that with flash_attn<2.1, using q_seqlen != k_seqlen (except for the case q_seqlen == 1) produces a wrong mask (top-left).
-        self._flash_attn_uses_top_left_mask = True#not is_flash_attn_greater_or_equal_2_10()
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.LongTensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_value: Optional[Tuple[torch.Tensor]] = None,
-        output_attentions: bool = False,
-        use_cache: bool = False,
-        **kwargs,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
-        # DiffLlamaFlashAttention2 attention does not support output_attentions
-        if "padding_mask" in kwargs:
-            warnings.warn(
-                "Passing `padding_mask` is deprecated and will be removed in v4.37. Please make sure use `attention_mask` instead.`"
-            )
-
-            # overwrite attention_mask with padding_mask
-            attention_mask = kwargs.pop("padding_mask")
-
-        output_attentions = False
-
-        bsz, q_len, _ = hidden_states.size()
-
-        query_states = self.q_proj(hidden_states)
-        key_states = self.k_proj(hidden_states)
-        value_states = self.v_proj(hidden_states)
-
-        # Flash attention requires the input to have the shape
-        # batch_size x seq_length x head_dim x hidden_dim
-        # therefore we just need to keep the original shape
-        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-        key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-        value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-
-        kv_seq_len = key_states.shape[-2]
-        if past_key_value is not None:
-            kv_seq_len += past_key_value[0].shape[-2]
-
-        cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
-
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
-
-        if past_key_value is not None:
-            # reuse k, v, self_attention
-            key_states = torch.cat([past_key_value[0], key_states], dim=2)
-            value_states = torch.cat([past_key_value[1], value_states], dim=2)
-
-        past_key_value = (key_states, value_states) if use_cache else None
-
-        # TODO: These transpose are quite inefficient but Flash Attention requires the layout [batch_size, sequence_length, num_heads, head_dim]. We would need to refactor the KV cache
-        # to be able to avoid many of these transpose/reshape/view.
-        query_states = query_states.transpose(1, 2)
-        key_states = key_states.transpose(1, 2)
-        value_states = value_states.transpose(1, 2)
-
-        dropout_rate = 0.0 if not self.training else self.attention_dropout
-
-        # In PEFT, usually we cast the layer norms in float32 for training stability reasons
-        # therefore the input hidden states gets silently casted in float32. Hence, we need
-        # cast them back in the correct dtype just to be sure everything works as expected.
-        # This might slowdown training & inference so it is recommended to not cast the LayerNorms
-        # in fp32. (DiffLlamaRMSNorm handles it correctly)
-
-        input_dtype = query_states.dtype
-        if input_dtype == torch.float32:
-            # Handle the case where the model is quantized
-            if hasattr(self.config, "_pre_quantization_dtype"):
-                target_dtype = self.config._pre_quantization_dtype
-            else:
-                target_dtype = self.q_proj.weight.dtype
-
-            logger.warning_once(
-                f"The input hidden states seems to be silently casted in float32, this might be related to"
-                f" the fact you have upcasted embedding or layer norm layers in float32. We will cast back the input in"
-                f" {target_dtype}."
-            )
-
-            query_states = query_states.to(target_dtype)
-            key_states = key_states.to(target_dtype)
-            value_states = value_states.to(target_dtype)
-
-        attn_output = self._flash_attention_forward(
-            query_states, key_states, value_states, attention_mask, q_len, dropout=dropout_rate
-        )
-
-        attn_output = attn_output.reshape(bsz, q_len, self.hidden_size).contiguous()
-        attn_output = self.o_proj(attn_output)
-
-        if not output_attentions:
-            attn_weights = None
-
-        return attn_output, attn_weights, past_key_value
-
-    def _flash_attention_forward(
-        self, query_states, key_states, value_states, attention_mask, query_length, dropout=0.0, softmax_scale=None
-    ):
-        """
-        Calls the forward method of Flash Attention - if the input hidden states contain at least one padding token
-        first unpad the input, then computes the attention scores and pad the final attention scores.
-
-        Args:
-            query_states (`torch.Tensor`):
-                Input query states to be passed to Flash Attention API
-            key_states (`torch.Tensor`):
-                Input key states to be passed to Flash Attention API
-            value_states (`torch.Tensor`):
-                Input value states to be passed to Flash Attention API
-            attention_mask (`torch.Tensor`):
-                The padding mask - corresponds to a tensor of size `(batch_size, seq_len)` where 0 stands for the
-                position of padding tokens and 1 for the position of non-padding tokens.
-            dropout (`int`, *optional*):
-                Attention dropout
-            softmax_scale (`float`, *optional*):
-                The scaling of QK^T before applying softmax. Default to 1 / sqrt(head_dim)
-        """
-        if not self._flash_attn_uses_top_left_mask:
-            causal = self.is_causal
-        else:
-            # TODO: Remove the `query_length != 1` check once Flash Attention for RoCm is bumped to 2.1. For details, please see the comment in DiffLlamaFlashAttention2 __init__.
-            causal = self.is_causal and query_length != 1
-
-        # Contains at least one padding token in the sequence
-        if attention_mask is not None:
-            batch_size = query_states.shape[0]
-            query_states, key_states, value_states, indices_q, cu_seq_lens, max_seq_lens = self._upad_input(
-                query_states, key_states, value_states, attention_mask, query_length
-            )
-
-            cu_seqlens_q, cu_seqlens_k = cu_seq_lens
-            max_seqlen_in_batch_q, max_seqlen_in_batch_k = max_seq_lens
-
-            attn_output_unpad = flash_attn_varlen_func(
-                query_states,
-                key_states,
-                value_states,
-                cu_seqlens_q=cu_seqlens_q,
-                cu_seqlens_k=cu_seqlens_k,
-                max_seqlen_q=max_seqlen_in_batch_q,
-                max_seqlen_k=max_seqlen_in_batch_k,
-                dropout_p=dropout,
-                softmax_scale=softmax_scale,
-                causal=causal,
-            )
-
-            attn_output = pad_input(attn_output_unpad, indices_q, batch_size, query_length)
-        else:
-            attn_output = flash_attn_func(
-                query_states, key_states, value_states, dropout, softmax_scale=softmax_scale, causal=causal
-            )
-
-        return attn_output
-
-    def _upad_input(self, query_layer, key_layer, value_layer, attention_mask, query_length):
-        indices_k, cu_seqlens_k, max_seqlen_in_batch_k = _get_unpad_data(attention_mask)
-        batch_size, kv_seq_len, num_key_value_heads, head_dim = key_layer.shape
-
-        key_layer = index_first_axis(
-            key_layer.reshape(batch_size * kv_seq_len, num_key_value_heads, head_dim), indices_k
-        )
-        value_layer = index_first_axis(
-            value_layer.reshape(batch_size * kv_seq_len, num_key_value_heads, head_dim), indices_k
-        )
-        if query_length == kv_seq_len:
-            query_layer = index_first_axis(
-                query_layer.reshape(batch_size * kv_seq_len, self.num_heads, head_dim), indices_k
-            )
-            cu_seqlens_q = cu_seqlens_k
-            max_seqlen_in_batch_q = max_seqlen_in_batch_k
-            indices_q = indices_k
-        elif query_length == 1:
-            max_seqlen_in_batch_q = 1
-            cu_seqlens_q = torch.arange(
-                batch_size + 1, dtype=torch.int32, device=query_layer.device
-            )  # There is a memcpy here, that is very bad.
-            indices_q = cu_seqlens_q[:-1]
-            query_layer = query_layer.squeeze(1)
-        else:
-            # The -q_len: slice assumes left padding.
-            attention_mask = attention_mask[:, -query_length:]
-            query_layer, indices_q, cu_seqlens_q, max_seqlen_in_batch_q = unpad_input(query_layer, attention_mask)
-
-        return (
-            query_layer,
-            key_layer,
-            value_layer,
-            indices_q,
-            (cu_seqlens_q, cu_seqlens_k),
-            (max_seqlen_in_batch_q, max_seqlen_in_batch_k),
-        )
 
 
-class DiffLlamaDecoderLayer(nn.Module):
-    def __init__(self, config: DiffLlamaConfig):
+class DiffMambaDecoderLayer(nn.Module):
+    def __init__(self, config: DiffMambaConfig):
         super().__init__()
         self.hidden_size = config.hidden_size
-        self.self_attn = (
-            DiffLlamaAttention(config=config)
-            if not getattr(config, "_flash_attn_2_enabled", False)
-            else DiffLlamaFlashAttention2(config=config)
-        )
-        self.mlp = DiffLlamaMLP(config)
-        self.input_layernorm = DiffLlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = DiffLlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.self_attn = DiffMambaAttention(config=config)
+            
+        self.mlp = DiffMambaMLP(config)
+        self.input_layernorm = DiffMambaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = DiffMambaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
         self,
@@ -754,7 +548,7 @@ LLAMA_START_DOCSTRING = r"""
     and behavior.
 
     Parameters:
-        config ([`DiffLlamaConfig`]):
+        config ([`DiffMambaConfig`]):
             Model configuration class with all the parameters of the model. Initializing with a config file does not
             load the weights associated with the model, only the configuration. Check out the
             [`~PreTrainedModel.from_pretrained`] method to load the model weights.
@@ -765,11 +559,11 @@ LLAMA_START_DOCSTRING = r"""
     "The bare LLaMA Model outputting raw hidden-states without any specific head on top.",
     LLAMA_START_DOCSTRING,
 )
-class DiffLlamaPreTrainedModel(PreTrainedModel):
-    config_class = DiffLlamaConfig
+class DiffMambaPreTrainedModel(PreTrainedModel):
+    config_class = DiffMambaConfig
     base_model_prefix = "model"
     supports_gradient_checkpointing = True
-    _no_split_modules = ["DiffLlamaDecoderLayer"]
+    _no_split_modules = ["DiffMambaDecoderLayer"]
     _skip_keys_device_placement = "past_key_values"
     _supports_flash_attn_2 = True
 
@@ -785,17 +579,80 @@ class DiffLlamaPreTrainedModel(PreTrainedModel):
         #         module.weight.data[module.padding_idx].zero_()
         return
 
+def create_block(
+    d_model,
+    ssm_cfg=None,
+    norm_epsilon=1e-5,
+    rms_norm=False,
+    residual_in_fp32=False,
+    fused_add_norm=False,
+    layer_idx=None,
+    device=None,
+    dtype=None,
+):
+    if ssm_cfg is None:
+        ssm_cfg = {}
+    factory_kwargs = {"device": device, "dtype": dtype}
+    mixer_cls = partial(Mamba, layer_idx=layer_idx, **ssm_cfg, **factory_kwargs)
+    norm_cls = partial(
+        nn.LayerNorm if not rms_norm else RMSNorm, eps=norm_epsilon, **factory_kwargs
+    )
+    block = Block(
+        d_model,
+        mixer_cls,
+        norm_cls=norm_cls,
+        fused_add_norm=fused_add_norm,
+        residual_in_fp32=residual_in_fp32,
+    )
+    block.layer_idx = layer_idx
+    return block
+
+# def FFT(x):
+#   return torch.fft.fft(x, dim=-2).real #torch.cat([transform(y, axis=-2).real for y in x.chunk(n_heads, dim=-1)],dim=-1) #/ math.sqrt(x.shape[-1]//n_heads)
+
+# def inverseFFT(x):
+#   return torch.fft.ifft(x, dim=-2).real #torch.cat([itransform(y, axis=-2).real for y in x.chunk(n_heads, dim=-1)],dim=-1) #/ math.sqrt(x.shape[-1]//n_heads)
+
+# class FFTModulator(nn.Module):
+#     def __init__(self, config):
+#         super().__init__()
+#         self.freq_modulator_1 = nn.Linear(config.hidden_size, 2*config.hidden_size)
+#         self.freq_modulator_2 = nn.Linear(2*config.hidden_size, config.hidden_size)
+#         self.relu = nn.ReLU()
+#         self.proj_1 = nn.Linear(config.hidden_size, 2*config.hidden_size)
+#         self.proj_2 = nn.Linear(2*config.hidden_size, config.hidden_size)
+#         self.pre_projection_layernorm = DiffMambaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+#         self.post_projection_layernorm = DiffMambaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+#     def forward(
+#         self,
+#         hidden_states: torch.FloatTensor,
+#     ):
 
 
-class DiffLlamaModel(DiffLlamaPreTrainedModel):
+#         dtype = hidden_states.dtype
+       
+#         cfft_output = FFT(hidden_states).to(dtype)
+#         cfft_modulated = self.freq_modulator_1(cfft_output)
+#         cfft_modulated = self.relu(cfft_modulated)
+#         cfft_modulated = self.freq_modulator_2(cfft_modulated)
+#         icfft_output = inverseFFT(cfft_modulated).to(dtype)
+#         icfft_output=self.pre_projection_layernorm(hidden_states + icfft_output)
+#         proj = self.proj_1(icfft_output)
+#         proj = self.relu(proj)
+#         proj = self.proj_2(proj)
+#         x=self.post_projection_layernorm(hidden_states + proj)
+
+#         return hidden_states
+
+class DiffMambaModel(DiffMambaPreTrainedModel):
     """
-    Transformer decoder consisting of *config.num_hidden_layers* layers. Each layer is a [`DiffLlamaDecoderLayer`]
+    Transformer decoder consisting of *config.num_hidden_layers* layers. Each layer is a [`DiffMambaDecoderLayer`]
 
     Args:
-        config: DiffLlamaConfig
+        config: DiffMambaConfig
     """
 
-    def __init__(self, config: DiffLlamaConfig):
+    def __init__(self, config: DiffMambaConfig):
         super().__init__(config)
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
@@ -811,9 +668,49 @@ class DiffLlamaModel(DiffLlamaPreTrainedModel):
             nn.SiLU(),
             nn.Linear(config.hidden_size//2, config.hidden_size, bias=False),
         )
-        self.layers = nn.ModuleList([DiffLlamaDecoderLayer(config) for _ in range(config.num_hidden_layers)])
-        self.RMSNorm = DiffLlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.norm = DiffLlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        # self.layers = nn.ModuleList([DiffMambaDecoderLayer(config) for _ in range(config.num_hidden_layers)])
+        
+        self.layers = nn.ModuleList(
+            [
+                create_block(
+                    config.hidden_size,
+                    ssm_cfg=None,
+                    norm_epsilon=config.rms_norm_eps,
+                    rms_norm=True,
+                    residual_in_fp32=True,
+                    fused_add_norm=True,
+                    layer_idx=i,
+                    # **factory_kwargs,
+                )
+                for i in range(config.num_hidden_layers)
+            ]
+        )
+
+        # self.layers_inverse = nn.ModuleList(
+        #     [
+        #         create_block(
+        #             config.hidden_size,
+        #             ssm_cfg=None,
+        #             norm_epsilon=config.rms_norm_eps,
+        #             rms_norm=True,
+        #             residual_in_fp32=True,
+        #             fused_add_norm=True,
+        #             layer_idx=i,
+        #             # **factory_kwargs,
+        #         )
+        #         for i in range(config.num_hidden_layers)
+        #     ]
+        # )
+
+        # self.layers_norms = nn.ModuleList(
+        #     [
+        #         DiffMambaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        #         for i in range(config.num_hidden_layers)
+        #     ]
+        # )
+        
+        self.RMSNorm = DiffMambaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = DiffMambaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
         self.gradient_checkpointing = False
         # Initialize weights and apply final processing
@@ -895,41 +792,69 @@ class DiffLlamaModel(DiffLlamaPreTrainedModel):
         all_self_attns = () if output_attentions else None
         next_decoder_cache = () if use_cache else None
 
-        for idx, decoder_layer in enumerate(self.layers):
-            if output_hidden_states:
-                all_hidden_states += (hidden_states,)
+        # for idx, decoder_layer in enumerate(self.layers):
+        #     if output_hidden_states:
+        #         all_hidden_states += (hidden_states,)
 
-            past_key_value = past_key_values[idx] if past_key_values is not None else None
+        #     past_key_value = past_key_values[idx] if past_key_values is not None else None
 
-            if self.gradient_checkpointing and self.training:
-                layer_outputs = self._gradient_checkpointing_func(
-                    decoder_layer.__call__,
-                    hidden_states,
-                    attention_mask,
-                    position_ids,
-                    past_key_value,
-                    output_attentions,
-                    use_cache,
-                )
-            else:
-                layer_outputs = decoder_layer(
-                    hidden_states,
-                    attention_mask=attention_mask,
-                    position_ids=position_ids,
-                    past_key_value=past_key_value,
-                    output_attentions=output_attentions,
-                    use_cache=use_cache,
-                )
+        #     if self.gradient_checkpointing and self.training:
+        #         layer_outputs = self._gradient_checkpointing_func(
+        #             decoder_layer.__call__,
+        #             hidden_states,
+        #             attention_mask,
+        #             position_ids,
+        #             past_key_value,
+        #             output_attentions,
+        #             use_cache,
+        #         )
+        #     else:
+        #         layer_outputs = decoder_layer(
+        #             hidden_states,
+        #             attention_mask=attention_mask,
+        #             position_ids=position_ids,
+        #             past_key_value=past_key_value,
+        #             output_attentions=output_attentions,
+        #             use_cache=use_cache,
+        #         )
 
-            hidden_states = layer_outputs[0]
+        #     hidden_states = layer_outputs[0]
 
-            if use_cache:
-                next_decoder_cache += (layer_outputs[2 if output_attentions else 1],)
+        #     if use_cache:
+        #         next_decoder_cache += (layer_outputs[2 if output_attentions else 1],)
 
-            if output_attentions:
-                all_self_attns += (layer_outputs[1],)
+        #     if output_attentions:
+        #         all_self_attns += (layer_outputs[1],)
 
-        hidden_states = self.norm(hidden_states)
+        residual_forward = None
+        residual_inverse = None
+        residual = None
+        # print(hidden_states.shape)
+        hidden_states_forward = hidden_states
+        hidden_states_inverse = torch.flip(hidden_states, dims=[1]) #inverse order
+
+        for i, layer_forward in enumerate(self.layers):
+            hidden_states, residual = layer_forward(
+                hidden_states, residual, inference_params=None
+            )
+
+            # hidden_states_inverse, residual_inverse = layer_inverse(
+            #     hidden_states_inverse, residual_inverse, inference_params=None
+            # )
+            
+            if (i + 1) % 4 == 0 and (i+1) != len(self.layers):
+                hidden_states = torch.flip(hidden_states, dims=[1])
+                residual = torch.flip(residual, dims=[1])
+            # hidden_states = norm(hidden_states_forward + hidden_states_inverse)
+            # hidden_states_forward = hidden_states
+            # hidden_states_inverse = torch.flip(hidden_states, dims=[1])
+            # residual_inverse = torch.flip(residual_inverse, dims=[1])
+        # for layer in self.layers_inverse:
+        #     hidden_states_inverse, residual_inverse = layer(
+        #         hidden_states_inverse, residual_inverse, inference_params=None
+        #     )
+
+        # hidden_states = self.norm(hidden_states_forward + hidden_states_inverse)
 
         # add hidden states from the last decoder layer
         if output_hidden_states:
@@ -946,12 +871,12 @@ class DiffLlamaModel(DiffLlamaPreTrainedModel):
         )
 
 
-class DiffLlamaForDiffusionLM(DiffLlamaPreTrainedModel):
+class DiffMambaForDiffusionLM(DiffMambaPreTrainedModel):
     # _tied_weights_keys = ["lm_head.weight"]
 
     def __init__(self, config):
         super().__init__(config)
-        self.model = DiffLlamaModel(config)
+        self.model = DiffMambaModel(config)
         self.vocab_size = config.vocab_size
         self.out_proj = nn.Sequential(
             nn.Linear(config.hidden_size, config.hidden_size, bias=False),
@@ -1024,9 +949,9 @@ class DiffLlamaForDiffusionLM(DiffLlamaPreTrainedModel):
         Example:
 
         ```python
-        >>> from transformers import AutoTokenizer, DiffLlamaForCausalLM
+        >>> from transformers import AutoTokenizer, DiffMambaForCausalLM
 
-        >>> model = DiffLlamaForCausalLM.from_pretrained(PATH_TO_CONVERTED_WEIGHTS)
+        >>> model = DiffMambaForCausalLM.from_pretrained(PATH_TO_CONVERTED_WEIGHTS)
         >>> tokenizer = AutoTokenizer.from_pretrained(PATH_TO_CONVERTED_TOKENIZER)
 
         >>> prompt = "Hey, are you conscious? Can you talk to me?"

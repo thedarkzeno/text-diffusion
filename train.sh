@@ -1,1 +1,1 @@
-python3 train_sample.py --pretrained_model_name_or_path="./diffllama-mini-sample" --dataset_name="Gustavosta/Stable-Diffusion-Prompts"  --output_dir="diffllama-mini-sample-trained" 
+python3 train_sample.py --pretrained_model_name_or_path="models/diffmamba-mini-sample" --dataset_name="Gustavosta/Stable-Diffusion-Prompts"  --output_dir="models/diffmamba-mini-sample-trained" 

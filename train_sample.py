@@ -40,7 +40,7 @@ from tqdm.auto import tqdm
 from transformers import AutoTokenizer
 
 from transformers.utils import ContextManagers
-from src.modeling_diffllama import DiffLlamaForDiffusionLM
+from src.modeling_diffmamba import DiffMambaForDiffusionLM
 
 import diffusers
 from diffusers import DDPMScheduler
@@ -151,7 +151,7 @@ def parse_args():
     parser.add_argument(
         "--gradient_accumulation_steps",
         type=int,
-        default=32,
+        default=64,
         help="Number of updates steps to accumulate before performing a backward/update pass.",
     )
     parser.add_argument(
@@ -252,7 +252,7 @@ def parse_args():
     parser.add_argument(
         "--mixed_precision",
         type=str,
-        default="bf16",
+        default="no",
         choices=["no", "fp16", "bf16"],
         help=(
             "Whether to use mixed precision. Choose between fp16 and bf16 (bfloat16). Bf16 requires PyTorch >="
@@ -410,10 +410,10 @@ def main():
         args.pretrained_model_name_or_path, revision=args.revision
     )
 
-    model = DiffLlamaForDiffusionLM.from_pretrained(
+    model = DiffMambaForDiffusionLM.from_pretrained(
         args.pretrained_model_name_or_path,
         use_flash_attention_2=True,
-        torch_dtype=torch.bfloat16
+        # torch_dtype=torch.float16
     )
 
     # Freeze vae and text_encoder and set model to trainable
@@ -422,10 +422,10 @@ def main():
 
     # Create EMA for the model.
     if args.use_ema:
-        ema_model = DiffLlamaForDiffusionLM.from_pretrained(
+        ema_model = DiffMambaForDiffusionLM.from_pretrained(
             args.pretrained_model_name_or_path
         )
-        ema_model = EMAModel(ema_model.parameters(), model_cls=DiffLlamaForDiffusionLM, model_config=ema_model.config)
+        ema_model = EMAModel(ema_model.parameters(), model_cls=DiffMambaForDiffusionLM, model_config=ema_model.config)
 
     tokenizer.add_special_tokens({'pad_token': '<pad>'})
 
@@ -449,7 +449,7 @@ def main():
 
         def load_model_hook(models, input_dir):
             if args.use_ema:
-                load_model = EMAModel.from_pretrained(os.path.join(input_dir, "model_ema"), DiffLlamaForDiffusionLM)
+                load_model = EMAModel.from_pretrained(os.path.join(input_dir, "model_ema"), DiffMambaForDiffusionLM)
                 ema_model.load_state_dict(load_model.state_dict())
                 ema_model.to(accelerator.device)
                 del load_model
@@ -459,7 +459,7 @@ def main():
                 model = models.pop()
 
                 # load diffusers style into model
-                load_model = DiffLlamaForDiffusionLM.from_pretrained(input_dir, subfolder="model")
+                load_model = DiffMambaForDiffusionLM.from_pretrained(input_dir, subfolder="model")
                 model.register_to_config(**load_model.config)
 
                 model.load_state_dict(load_model.state_dict())

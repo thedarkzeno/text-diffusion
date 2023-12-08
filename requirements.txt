@@ -1,0 +1,8 @@
+transformers
+accelerate
+datasets
+diffusers
+flash-attn
+causal-conv1d
+mamba-ssm
+triton
