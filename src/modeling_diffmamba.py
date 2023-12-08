@@ -31,16 +31,12 @@ from torch import nn
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 
 from transformers.activations import ACT2FN
-from transformers.modeling_attn_mask_utils import AttentionMaskConverter, _prepare_4d_attention_mask, _prepare_4d_causal_attention_mask
 from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast, SequenceClassifierOutputWithPast
 from transformers.modeling_utils import PreTrainedModel
 # from transformers.pytorch_utils import ALL_LAYERNORM_LAYERS, is_torch_greater_or_equal_than_1_13
 from transformers.utils import (
     ModelOutput,
     add_start_docstrings,
-    add_start_docstrings_to_model_forward,
-    is_flash_attn_2_available,
-    # is_flash_attn_greater_or_equal_2_10,
     logging,
     replace_return_docstrings,
 )
@@ -53,13 +49,6 @@ try:
 except ImportError:
     RMSNorm, layer_norm_fn, rms_norm_fn = None, None, None
 
-# This makes `_prepare_4d_causal_attention_mask` a leaf function in the FX graph.
-# It means that the function will not be traced through and simply appear as a node in the graph.
-# if is_torch_fx_available():
-#     if not is_torch_greater_or_equal_than_1_13:
-#         import torch.fx
-
-#     _prepare_4d_causal_attention_mask = torch.fx.wrap(_prepare_4d_causal_attention_mask)
 
 
 logger = logging.get_logger(__name__)
@@ -67,16 +56,6 @@ logger = logging.get_logger(__name__)
 _CONFIG_FOR_DOC = "DiffMambaConfig"
 
 
-def _get_unpad_data(attention_mask):
-    seqlens_in_batch = attention_mask.sum(dim=-1, dtype=torch.int32)
-    indices = torch.nonzero(attention_mask.flatten(), as_tuple=False).flatten()
-    max_seqlen_in_batch = seqlens_in_batch.max().item()
-    cu_seqlens = F.pad(torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.torch.int32), (1, 0))
-    return (
-        indices,
-        cu_seqlens,
-        max_seqlen_in_batch,
-    )
 
 def timestep_embedding(timesteps, dim, max_period=10000):
     """
@@ -98,22 +77,7 @@ def timestep_embedding(timesteps, dim, max_period=10000):
         embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
     return embedding
 
-def _expand_mask(mask: torch.Tensor, dtype: torch.dtype, tgt_len: Optional[int] = None):
-    warnings.warn(
-        "Calling `transformers.models.llama.modeling_llama._prepare_4d_attention_mask` is deprecated and will be removed in v4.37. Use `transformers.modeling_attn_mask_utils.AttentionMaskConverter._prepare_4d_attention_mask"
-    )
-    return AttentionMaskConverter._prepare_4d_attention_mask(mask=mask, dtype=dtype, tgt_len=tgt_len)
 
-
-def _make_causal_mask(
-    input_ids_shape: torch.Size, dtype: torch.dtype, device: torch.device, past_key_values_length: int = 0
-):
-    warnings.warn(
-        "Calling `transformers.models.llama.modeling_llama._make_causal_mask` is deprecated and will be removed in v4.37. Use `transformers.models.llama.modeling_llama.AttentionMaskConverter._make_causal_mask"
-    )
-    return AttentionMaskConverter._make_causal_mask(
-        input_ids_shape=input_ids_shape, dtype=dtype, device=device, past_key_values_length=past_key_values_length
-    )
 
 @dataclass
 class DiffusionLMOutput(ModelOutput):
@@ -607,43 +571,6 @@ def create_block(
     block.layer_idx = layer_idx
     return block
 
-# def FFT(x):
-#   return torch.fft.fft(x, dim=-2).real #torch.cat([transform(y, axis=-2).real for y in x.chunk(n_heads, dim=-1)],dim=-1) #/ math.sqrt(x.shape[-1]//n_heads)
-
-# def inverseFFT(x):
-#   return torch.fft.ifft(x, dim=-2).real #torch.cat([itransform(y, axis=-2).real for y in x.chunk(n_heads, dim=-1)],dim=-1) #/ math.sqrt(x.shape[-1]//n_heads)
-
-# class FFTModulator(nn.Module):
-#     def __init__(self, config):
-#         super().__init__()
-#         self.freq_modulator_1 = nn.Linear(config.hidden_size, 2*config.hidden_size)
-#         self.freq_modulator_2 = nn.Linear(2*config.hidden_size, config.hidden_size)
-#         self.relu = nn.ReLU()
-#         self.proj_1 = nn.Linear(config.hidden_size, 2*config.hidden_size)
-#         self.proj_2 = nn.Linear(2*config.hidden_size, config.hidden_size)
-#         self.pre_projection_layernorm = DiffMambaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-#         self.post_projection_layernorm = DiffMambaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-#     def forward(
-#         self,
-#         hidden_states: torch.FloatTensor,
-#     ):
-
-
-#         dtype = hidden_states.dtype
-       
-#         cfft_output = FFT(hidden_states).to(dtype)
-#         cfft_modulated = self.freq_modulator_1(cfft_output)
-#         cfft_modulated = self.relu(cfft_modulated)
-#         cfft_modulated = self.freq_modulator_2(cfft_modulated)
-#         icfft_output = inverseFFT(cfft_modulated).to(dtype)
-#         icfft_output=self.pre_projection_layernorm(hidden_states + icfft_output)
-#         proj = self.proj_1(icfft_output)
-#         proj = self.relu(proj)
-#         proj = self.proj_2(proj)
-#         x=self.post_projection_layernorm(hidden_states + proj)
-
-#         return hidden_states
-
 class DiffMambaModel(DiffMambaPreTrainedModel):
     """
     Transformer decoder consisting of *config.num_hidden_layers* layers. Each layer is a [`DiffMambaDecoderLayer`]
@@ -685,29 +612,6 @@ class DiffMambaModel(DiffMambaPreTrainedModel):
                 for i in range(config.num_hidden_layers)
             ]
         )
-
-        # self.layers_inverse = nn.ModuleList(
-        #     [
-        #         create_block(
-        #             config.hidden_size,
-        #             ssm_cfg=None,
-        #             norm_epsilon=config.rms_norm_eps,
-        #             rms_norm=True,
-        #             residual_in_fp32=True,
-        #             fused_add_norm=True,
-        #             layer_idx=i,
-        #             # **factory_kwargs,
-        #         )
-        #         for i in range(config.num_hidden_layers)
-        #     ]
-        # )
-
-        # self.layers_norms = nn.ModuleList(
-        #     [
-        #         DiffMambaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        #         for i in range(config.num_hidden_layers)
-        #     ]
-        # )
         
         self.RMSNorm = DiffMambaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.norm = DiffMambaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -759,16 +663,6 @@ class DiffMambaModel(DiffMambaPreTrainedModel):
             position_ids = position_ids.unsqueeze(0)
 
 
-        if getattr(self.config, "_flash_attn_2_enabled", False):
-            # 2d mask is passed through the layers
-            attention_mask = attention_mask if (attention_mask is not None and 0 in attention_mask) else None
-        else:
-            # 4d mask is passed through the layers
-            # attention_mask = _prepare_4d_causal_attention_mask(
-            #     attention_mask, (batch_size, seq_length), input_embeds, past_key_values_length
-            # )
-            attention_mask = _prepare_4d_attention_mask(attention_mask, input_embeds.dtype, seq_length)
-
         # embed positions
         
 
@@ -791,70 +685,18 @@ class DiffMambaModel(DiffMambaPreTrainedModel):
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
         next_decoder_cache = () if use_cache else None
-
-        # for idx, decoder_layer in enumerate(self.layers):
-        #     if output_hidden_states:
-        #         all_hidden_states += (hidden_states,)
-
-        #     past_key_value = past_key_values[idx] if past_key_values is not None else None
-
-        #     if self.gradient_checkpointing and self.training:
-        #         layer_outputs = self._gradient_checkpointing_func(
-        #             decoder_layer.__call__,
-        #             hidden_states,
-        #             attention_mask,
-        #             position_ids,
-        #             past_key_value,
-        #             output_attentions,
-        #             use_cache,
-        #         )
-        #     else:
-        #         layer_outputs = decoder_layer(
-        #             hidden_states,
-        #             attention_mask=attention_mask,
-        #             position_ids=position_ids,
-        #             past_key_value=past_key_value,
-        #             output_attentions=output_attentions,
-        #             use_cache=use_cache,
-        #         )
-
-        #     hidden_states = layer_outputs[0]
-
-        #     if use_cache:
-        #         next_decoder_cache += (layer_outputs[2 if output_attentions else 1],)
-
-        #     if output_attentions:
-        #         all_self_attns += (layer_outputs[1],)
-
-        residual_forward = None
-        residual_inverse = None
+       
         residual = None
-        # print(hidden_states.shape)
-        hidden_states_forward = hidden_states
-        hidden_states_inverse = torch.flip(hidden_states, dims=[1]) #inverse order
 
         for i, layer_forward in enumerate(self.layers):
             hidden_states, residual = layer_forward(
                 hidden_states, residual, inference_params=None
             )
 
-            # hidden_states_inverse, residual_inverse = layer_inverse(
-            #     hidden_states_inverse, residual_inverse, inference_params=None
-            # )
-            
             if (i + 1) % 4 == 0 and (i+1) != len(self.layers):
                 hidden_states = torch.flip(hidden_states, dims=[1])
                 residual = torch.flip(residual, dims=[1])
-            # hidden_states = norm(hidden_states_forward + hidden_states_inverse)
-            # hidden_states_forward = hidden_states
-            # hidden_states_inverse = torch.flip(hidden_states, dims=[1])
-            # residual_inverse = torch.flip(residual_inverse, dims=[1])
-        # for layer in self.layers_inverse:
-        #     hidden_states_inverse, residual_inverse = layer(
-        #         hidden_states_inverse, residual_inverse, inference_params=None
-        #     )
 
-        # hidden_states = self.norm(hidden_states_forward + hidden_states_inverse)
 
         # add hidden states from the last decoder layer
         if output_hidden_states:
