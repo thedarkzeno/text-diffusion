@@ -95,9 +95,9 @@ def parse_args():
     )
     parser.add_argument(
         "--streaming",
-        type="store_true",
+        action="store_true",
         default=False,
-        help="Streaming the dataset"
+        help="Streaming the dataset",
     )
     parser.add_argument(
         "--train_data_dir",
@@ -113,6 +113,12 @@ def parse_args():
         "--text_column",
         type=str,
         default="Prompt",
+        help="The column of the dataset containing a caption or a list of captions.",
+    )
+    parser.add_argument(
+        "--instruction_column",
+        type=str,
+        default="data1",
         help="The column of the dataset containing a caption or a list of captions.",
     )
     parser.add_argument(
@@ -147,7 +153,7 @@ def parse_args():
     parser.add_argument(
         "--train_batch_size", type=int, default=16, help="Batch size (per device) for the training dataloader."
     )
-    parser.add_argument("--num_train_epochs", type=int, default=1000)
+    parser.add_argument("--num_train_epochs", type=int, default=10)
     parser.add_argument(
         "--max_train_steps",
         type=int,
@@ -418,9 +424,13 @@ def main():
 
     model = DiffMambaForDiffusionLM.from_pretrained(
         args.pretrained_model_name_or_path,
-        use_flash_attention_2=True,
-        # torch_dtype=torch.float16
+        add_cross_attention=True
+        # use_flash_attention_2=True,
+        # torch_dtype=torch.bfloat16
     )
+    model.config.add_cross_attention=True
+    print(args.pretrained_model_name_or_path)
+    print(model.config)
 
     # Freeze vae and text_encoder and set model to trainable
     model.train()
@@ -532,7 +542,7 @@ def main():
     # dataset_columns = DATASET_NAME_MAPPING.get(args.dataset_name, None)
 
     if args.text_column is None:
-        text_column = column_names[0]
+        text_column = column_names[1]
     else:
         text_column = args.text_column
         if text_column not in column_names:
@@ -540,27 +550,51 @@ def main():
             raise ValueError(
                 f"--text_column' value '{args.text_column}' needs to be one of: {', '.join(column_names)}"
             )
+        
+    if args.instruction_column is None:
+        instruction_column = column_names[0]
+    else:
+        instruction_column = args.instruction_column
+        if instruction_column not in column_names:
+            print(instruction_column, column_names)
+            raise ValueError(
+                f"--instruction_column' value '{args.instruction_column}' needs to be one of: {', '.join(column_names)}"
+            )
 
     # Preprocessing the datasets.
-    # We need to tokenize input captions and transform the images.
+    # We need to tokenize input texts and transform the images.
 
-    def tokenize_captions(examples, is_train=True):
-        captions = []
-        for caption in examples[text_column]:
-            if isinstance(caption, str):
-                captions.append(caption)
-            elif isinstance(caption, (list, np.ndarray)):
-                # take a random caption if there are multiple
-                captions.append(random.choice(caption) if is_train else caption[0])
+    def tokenize_text(examples, is_train=True):
+        texts = []
+        instructions = []
+        for text, instruction in zip(examples[text_column], examples[instruction_column]):
+            if isinstance(text, str):
+                texts.append(text)
+            elif isinstance(text, (list, np.ndarray)):
+                # take a random text if there are multiple
+                texts.append(random.choice(text) if is_train else text[0])
             else:
                 raise ValueError(
-                    f"Caption column `{text_column}` should contain either strings or lists of strings."
+                    f"Text column `{text_column}` should contain either strings or lists of strings."
                 )
-        # print(captions)
-        inputs = tokenizer(
-            captions, max_length=64, padding="max_length", truncation=True, return_tensors="pt"
+            
+            if isinstance(instruction, str):
+                instructions.append(instruction)
+            elif isinstance(instruction, (list, np.ndarray)):
+                # take a random instruction if there are multiple
+                instructions.append(random.choice(instruction) if is_train else instruction[0])
+            else:
+                raise ValueError(
+                    f"Instruction column `{instruction_column}` should contain either strings or lists of strings."
+                )
+        # print(texts)
+        instruction_inputs = tokenizer(
+            instructions, max_length=64, padding="max_length", truncation=True, return_tensors="pt"
         )
-        return inputs.input_ids
+        inputs = tokenizer(
+            texts, max_length=64, padding="max_length", truncation=True, return_tensors="pt"
+        )
+        return inputs.input_ids, instruction_inputs.input_ids
 
 
     
@@ -571,7 +605,7 @@ def main():
         return vectors
 
     def preprocess_train(examples):
-        examples["input_ids"] = tokenize_captions(examples)
+        examples["input_ids"], examples["instruction_input_ids"] = tokenize_text(examples)
         return examples
 
     with accelerator.main_process_first():
@@ -582,9 +616,9 @@ def main():
 
     def collate_fn(examples):
         input_ids = torch.stack([example["input_ids"] for example in examples])
-        # one_hots = torch.stack([apply_embeddings(example["input_ids"]) for example in examples])
-        # one_hots = apply_embeddings(input_ids)
-        return {"input_ids": input_ids}
+        instruction_input_ids = torch.stack([example["instruction_input_ids"] for example in examples])
+
+        return {"input_ids": input_ids, "instruction_input_ids": instruction_input_ids}
     
 
     
@@ -710,6 +744,7 @@ def main():
             with accelerator.accumulate(model):
                 # Convert images to latent space
                 input_ids = batch["input_ids"].to(model.device)
+                instruction_input_ids = batch["instruction_input_ids"].to(model.device)
 
                 max_steps = noise_scheduler.config.num_train_timesteps
                 bsz = input_ids.shape[0]
@@ -717,6 +752,7 @@ def main():
                 timesteps = timesteps.long()
 
                 latents = apply_embeddings(input_ids)
+                instruction_latents = apply_embeddings(instruction_input_ids)
                 # print(latents.shape)
                 
                 noise = torch.randn_like(latents, requires_grad=False)
@@ -743,7 +779,7 @@ def main():
                     raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
 
                 # Predict the noise residual and compute loss
-                outputs = model(noisy_latents, timesteps=timesteps, labels=input_ids)
+                outputs = model(noisy_latents, timesteps=timesteps, labels=input_ids, encoder_hidden_states=instruction_latents)
                 nll_loss=outputs.loss
                 model_pred = outputs.last_hidden_state
 

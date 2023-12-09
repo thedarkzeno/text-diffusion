@@ -103,125 +103,6 @@ class DiffMambaRMSNorm(nn.Module):
         return self.weight * hidden_states.to(input_dtype)
 
 
-# ALL_LAYERNORM_LAYERS.append(DiffMambaRMSNorm)
-
-
-class DiffMambaRotaryEmbedding(nn.Module):
-    def __init__(self, dim, max_position_embeddings=2048, base=10000, device=None):
-        super().__init__()
-
-        self.dim = dim
-        self.max_position_embeddings = max_position_embeddings
-        self.base = base
-        inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2).float().to(device) / self.dim))
-        self.register_buffer("inv_freq", inv_freq, persistent=False)
-
-        # Build here to make `torch.jit.trace` work.
-        self._set_cos_sin_cache(
-            seq_len=max_position_embeddings, device=self.inv_freq.device, dtype=torch.get_default_dtype()
-        )
-
-    def _set_cos_sin_cache(self, seq_len, device, dtype):
-        self.max_seq_len_cached = seq_len
-        t = torch.arange(self.max_seq_len_cached, device=device, dtype=self.inv_freq.dtype)
-
-        freqs = torch.outer(t, self.inv_freq)
-        # Different from paper, but it uses a different permutation in order to obtain the same calculation
-        emb = torch.cat((freqs, freqs), dim=-1)
-        self.register_buffer("cos_cached", emb.cos().to(dtype), persistent=False)
-        self.register_buffer("sin_cached", emb.sin().to(dtype), persistent=False)
-
-    def forward(self, x, seq_len=None):
-        # x: [bs, num_attention_heads, seq_len, head_size]
-        if seq_len > self.max_seq_len_cached:
-            self._set_cos_sin_cache(seq_len=seq_len, device=x.device, dtype=x.dtype)
-
-        return (
-            self.cos_cached[:seq_len].to(dtype=x.dtype),
-            self.sin_cached[:seq_len].to(dtype=x.dtype),
-        )
-
-
-class DiffMambaLinearScalingRotaryEmbedding(DiffMambaRotaryEmbedding):
-    """DiffMambaRotaryEmbedding extended with linear scaling. Credits to the Reddit user /u/kaiokendev"""
-
-    def __init__(self, dim, max_position_embeddings=2048, base=10000, device=None, scaling_factor=1.0):
-        self.scaling_factor = scaling_factor
-        super().__init__(dim, max_position_embeddings, base, device)
-
-    def _set_cos_sin_cache(self, seq_len, device, dtype):
-        self.max_seq_len_cached = seq_len
-        t = torch.arange(self.max_seq_len_cached, device=device, dtype=self.inv_freq.dtype)
-        t = t / self.scaling_factor
-
-        freqs = torch.outer(t, self.inv_freq)
-        # Different from paper, but it uses a different permutation in order to obtain the same calculation
-        emb = torch.cat((freqs, freqs), dim=-1)
-        self.register_buffer("cos_cached", emb.cos().to(dtype), persistent=False)
-        self.register_buffer("sin_cached", emb.sin().to(dtype), persistent=False)
-
-
-class DiffMambaDynamicNTKScalingRotaryEmbedding(DiffMambaRotaryEmbedding):
-    """DiffMambaRotaryEmbedding extended with Dynamic NTK scaling. Credits to the Reddit users /u/bloc97 and /u/emozilla"""
-
-    def __init__(self, dim, max_position_embeddings=2048, base=10000, device=None, scaling_factor=1.0):
-        self.scaling_factor = scaling_factor
-        super().__init__(dim, max_position_embeddings, base, device)
-
-    def _set_cos_sin_cache(self, seq_len, device, dtype):
-        self.max_seq_len_cached = seq_len
-
-        if seq_len > self.max_position_embeddings:
-            base = self.base * (
-                (self.scaling_factor * seq_len / self.max_position_embeddings) - (self.scaling_factor - 1)
-            ) ** (self.dim / (self.dim - 2))
-            inv_freq = 1.0 / (base ** (torch.arange(0, self.dim, 2).float().to(device) / self.dim))
-            self.register_buffer("inv_freq", inv_freq, persistent=False)
-
-        t = torch.arange(self.max_seq_len_cached, device=device, dtype=self.inv_freq.dtype)
-
-        freqs = torch.outer(t, self.inv_freq)
-        # Different from paper, but it uses a different permutation in order to obtain the same calculation
-        emb = torch.cat((freqs, freqs), dim=-1)
-        self.register_buffer("cos_cached", emb.cos().to(dtype), persistent=False)
-        self.register_buffer("sin_cached", emb.sin().to(dtype), persistent=False)
-
-
-def rotate_half(x):
-    """Rotates half the hidden dims of the input."""
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return torch.cat((-x2, x1), dim=-1)
-
-
-def apply_rotary_pos_emb(q, k, cos, sin, position_ids, unsqueeze_dim=1):
-    """Applies Rotary Position Embedding to the query and key tensors.
-
-    Args:
-        q (`torch.Tensor`): The query tensor.
-        k (`torch.Tensor`): The key tensor.
-        cos (`torch.Tensor`): The cosine part of the rotary embedding.
-        sin (`torch.Tensor`): The sine part of the rotary embedding.
-        position_ids (`torch.Tensor`):
-            The position indices of the tokens corresponding to the query and key tensors. For example, this can be
-            used to pass offsetted position ids when working with a KV-cache.
-        unsqueeze_dim (`int`, *optional*, defaults to 1):
-            The 'unsqueeze_dim' argument specifies the dimension along which to unsqueeze cos[position_ids] and
-            sin[position_ids] so that they can be properly broadcasted to the dimensions of q and k. For example, note
-            that cos[position_ids] and sin[position_ids] have the shape [batch_size, seq_len, head_dim]. Then, if q and
-            k have the shape [batch_size, heads, seq_len, head_dim], then setting unsqueeze_dim=1 makes
-            cos[position_ids] and sin[position_ids] broadcastable to the shapes of q and k. Similarly, if q and k have
-            the shape [batch_size, seq_len, heads, head_dim], then set unsqueeze_dim=2.
-    Returns:
-        `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
-    """
-    cos = cos[position_ids].unsqueeze(unsqueeze_dim)
-    sin = sin[position_ids].unsqueeze(unsqueeze_dim)
-    q_embed = (q * cos) + (rotate_half(q) * sin)
-    k_embed = (k * cos) + (rotate_half(k) * sin)
-    return q_embed, k_embed
-
-
 class DiffMambaMLP(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -256,291 +137,89 @@ class DiffMambaMLP(nn.Module):
         return down_proj
 
 
-def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
-    """
-    This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
-    num_key_value_heads, seqlen, head_dim) to (batch, num_attention_heads, seqlen, head_dim)
-    """
-    batch, num_key_value_heads, slen, head_dim = hidden_states.shape
-    if n_rep == 1:
-        return hidden_states
-    hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
-    return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
-
-
-class DiffMambaAttention(nn.Module):
-    """Multi-headed attention from 'Attention Is All You Need' paper"""
-
-    def __init__(self, config: DiffMambaConfig):
+class DiffMambaCrossAttention(nn.Module):
+    def __init__(self, config):
         super().__init__()
-        self.config = config
-        self.attention_dropout = config.attention_dropout
-        self.hidden_size = config.hidden_size
-        self.num_heads = config.num_attention_heads
-        self.head_dim = self.hidden_size // self.num_heads
-        self.num_key_value_heads = config.num_key_value_heads
-        self.num_key_value_groups = self.num_heads // self.num_key_value_heads
-        self.max_position_embeddings = config.max_position_embeddings
-        self.rope_theta = config.rope_theta
-        self.is_causal = False
-
-        if (self.head_dim * self.num_heads) != self.hidden_size:
+        self.config=config
+        if config.hidden_size % config.num_attention_heads != 0 and not hasattr(config, "embedding_size"):
             raise ValueError(
-                f"hidden_size must be divisible by num_heads (got `hidden_size`: {self.hidden_size}"
-                f" and `num_heads`: {self.num_heads})."
+                f"The hidden size ({config.hidden_size}) is not a multiple of the number of attention "
+                f"heads ({config.num_attention_heads})"
             )
 
-        self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=config.attention_bias)
-        self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
-        self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
-        self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=config.attention_bias)
-        self._init_rope()
+        self.num_attention_heads = config.num_attention_heads
+        self.attention_head_size = int(config.hidden_size / config.num_attention_heads)
+        self.all_head_size = self.num_attention_heads * self.attention_head_size
 
-    def _init_rope(self):
-        if self.config.rope_scaling is None:
-            self.rotary_emb = DiffMambaRotaryEmbedding(
-                self.head_dim,
-                max_position_embeddings=self.max_position_embeddings,
-                base=self.rope_theta,
-            )
-        else:
-            scaling_type = self.config.rope_scaling["type"]
-            scaling_factor = self.config.rope_scaling["factor"]
-            if scaling_type == "linear":
-                self.rotary_emb = DiffMambaLinearScalingRotaryEmbedding(
-                    self.head_dim,
-                    max_position_embeddings=self.max_position_embeddings,
-                    scaling_factor=scaling_factor,
-                    base=self.rope_theta,
-                )
-            elif scaling_type == "dynamic":
-                self.rotary_emb = DiffMambaDynamicNTKScalingRotaryEmbedding(
-                    self.head_dim,
-                    max_position_embeddings=self.max_position_embeddings,
-                    scaling_factor=scaling_factor,
-                    base=self.rope_theta,
-                )
-            else:
-                raise ValueError(f"Unknown RoPE scaling type {scaling_type}")
+        self.query = nn.Linear(config.hidden_size, self.all_head_size, bias=False)
+        self.key = nn.Linear(config.hidden_size, self.all_head_size, bias=False)
+        self.value = nn.Linear(config.hidden_size, self.all_head_size, bias=False)
 
-    def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
-        return tensor.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
+        self.dropout = nn.Dropout(config.attention_dropout)
+
+
+    def transpose_for_scores(self, x):
+        new_x_shape = x.size()[:-1] + (self.num_attention_heads, self.attention_head_size)
+        x = x.view(*new_x_shape)
+        return x.permute(0, 2, 1, 3)
 
     def forward(
         self,
-        hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_value: Optional[Tuple[torch.Tensor]] = None,
-        output_attentions: bool = False,
-        use_cache: bool = False,
-        **kwargs,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
-        if "padding_mask" in kwargs:
-            warnings.warn(
-                "Passing `padding_mask` is deprecated and will be removed in v4.37. Please make sure use `attention_mask` instead.`"
-            )
+        hidden_states,
+        encoder_hidden_states,
+        attention_mask=None,
+        head_mask=None,
+        encoder_attention_mask=None,
+    ):
+        mixed_query_layer = self.query(hidden_states)
+        query_layer = self.transpose_for_scores(mixed_query_layer)
 
-        bsz, q_len, _ = hidden_states.size()
 
-        if self.config.pretraining_tp > 1:
-            key_value_slicing = (self.num_key_value_heads * self.head_dim) // self.config.pretraining_tp
-            query_slices = self.q_proj.weight.split(
-                (self.num_heads * self.head_dim) // self.config.pretraining_tp, dim=0
-            )
-            key_slices = self.k_proj.weight.split(key_value_slicing, dim=0)
-            value_slices = self.v_proj.weight.split(key_value_slicing, dim=0)
+        key_layer = self.transpose_for_scores(self.key(encoder_hidden_states))
+        value_layer = self.transpose_for_scores(self.value(encoder_hidden_states))
+        attention_mask = encoder_attention_mask
+        
+        
 
-            query_states = [F.linear(hidden_states, query_slices[i]) for i in range(self.config.pretraining_tp)]
-            query_states = torch.cat(query_states, dim=-1)
+        # Take the dot product between "query" and "key" to get the raw attention scores.
+        attention_scores = torch.matmul(query_layer, key_layer.transpose(-1, -2))
 
-            key_states = [F.linear(hidden_states, key_slices[i]) for i in range(self.config.pretraining_tp)]
-            key_states = torch.cat(key_states, dim=-1)
-
-            value_states = [F.linear(hidden_states, value_slices[i]) for i in range(self.config.pretraining_tp)]
-            value_states = torch.cat(value_states, dim=-1)
-
-        else:
-            query_states = self.q_proj(hidden_states)
-            key_states = self.k_proj(hidden_states)
-            value_states = self.v_proj(hidden_states)
-
-        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-        key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-        value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-
-        kv_seq_len = key_states.shape[-2]
-        if past_key_value is not None:
-            kv_seq_len += past_key_value[0].shape[-2]
-        cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
-
-        if past_key_value is not None:
-            # reuse k, v, self_attention
-            key_states = torch.cat([past_key_value[0], key_states], dim=2)
-            value_states = torch.cat([past_key_value[1], value_states], dim=2)
-
-        past_key_value = (key_states, value_states) if use_cache else None
-
-        key_states = repeat_kv(key_states, self.num_key_value_groups)
-        value_states = repeat_kv(value_states, self.num_key_value_groups)
-
-        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
-
-        if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
-            raise ValueError(
-                f"Attention weights should be of size {(bsz, self.num_heads, q_len, kv_seq_len)}, but is"
-                f" {attn_weights.size()}"
-            )
-
+        attention_scores = attention_scores / math.sqrt(self.attention_head_size)
         if attention_mask is not None:
-            if attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
-                raise ValueError(
-                    f"Attention mask should be of size {(bsz, 1, q_len, kv_seq_len)}, but is {attention_mask.size()}"
-                )
-            attn_weights = attn_weights + attention_mask
+            # Apply the attention mask is (precomputed for all layers in RoFormerModel forward() function)
+            attention_scores = attention_scores + attention_mask
 
-        # upcast attention to fp32
-        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-        attn_weights = nn.functional.dropout(attn_weights, p=self.attention_dropout, training=self.training)
-        attn_output = torch.matmul(attn_weights, value_states)
+        # Normalize the attention scores to probabilities.
+        attention_probs = nn.functional.softmax(attention_scores, dim=-1)
 
-        if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
-            raise ValueError(
-                f"`attn_output` should be of size {(bsz, self.num_heads, q_len, self.head_dim)}, but is"
-                f" {attn_output.size()}"
-            )
+        # This is actually dropping out entire tokens to attend to, which might
+        # seem a bit unusual, but is taken from the original Transformer paper.
+        attention_probs = self.dropout(attention_probs)
 
-        attn_output = attn_output.transpose(1, 2).contiguous()
+        # Mask heads if we want to
+        if head_mask is not None:
+            attention_probs = attention_probs * head_mask
 
-        attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
+        context_layer = torch.matmul(attention_probs, value_layer)
 
-        if self.config.pretraining_tp > 1:
-            attn_output = attn_output.split(self.hidden_size // self.config.pretraining_tp, dim=2)
-            o_proj_slices = self.o_proj.weight.split(self.hidden_size // self.config.pretraining_tp, dim=1)
-            attn_output = sum([F.linear(attn_output[i], o_proj_slices[i]) for i in range(self.config.pretraining_tp)])
-        else:
-            attn_output = self.o_proj(attn_output)
-
-        if not output_attentions:
-            attn_weights = None
-
-        return attn_output, attn_weights, past_key_value
+        context_layer = context_layer.permute(0, 2, 1, 3).contiguous()
+        new_context_layer_shape = context_layer.size()[:-2] + (self.all_head_size,)
+        context_layer = context_layer.view(*new_context_layer_shape)
 
 
-
-
-class DiffMambaDecoderLayer(nn.Module):
-    def __init__(self, config: DiffMambaConfig):
-        super().__init__()
-        self.hidden_size = config.hidden_size
-        self.self_attn = DiffMambaAttention(config=config)
-            
-        self.mlp = DiffMambaMLP(config)
-        self.input_layernorm = DiffMambaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = DiffMambaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_value: Optional[Tuple[torch.Tensor]] = None,
-        output_attentions: Optional[bool] = False,
-        use_cache: Optional[bool] = False,
-        **kwargs,
-    ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
-        """
-        Args:
-            hidden_states (`torch.FloatTensor`): input to the layer of shape `(batch, seq_len, embed_dim)`
-            attention_mask (`torch.FloatTensor`, *optional*):
-                attention mask of size `(batch_size, sequence_length)` if flash attention is used or `(batch_size, 1,
-                query_sequence_length, key_sequence_length)` if default attention is used.
-            output_attentions (`bool`, *optional*):
-                Whether or not to return the attentions tensors of all attention layers. See `attentions` under
-                returned tensors for more detail.
-            use_cache (`bool`, *optional*):
-                If set to `True`, `past_key_values` key value states are returned and can be used to speed up decoding
-                (see `past_key_values`).
-            past_key_value (`Tuple(torch.FloatTensor)`, *optional*): cached past key and value projection states
-        """
-        if "padding_mask" in kwargs:
-            warnings.warn(
-                "Passing `padding_mask` is deprecated and will be removed in v4.37. Please make sure use `attention_mask` instead.`"
-            )
-
-        residual = hidden_states
-
-        hidden_states = self.input_layernorm(hidden_states)
-
-        # Self Attention
-        hidden_states, self_attn_weights, present_key_value = self.self_attn(
-            hidden_states=hidden_states,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_value=past_key_value,
-            output_attentions=output_attentions,
-            use_cache=use_cache,
-            **kwargs,
-        )
-        hidden_states = residual + hidden_states
-
-        # Fully Connected
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
-        hidden_states = residual + hidden_states
-
-        outputs = (hidden_states,)
-
-        if output_attentions:
-            outputs += (self_attn_weights,)
-
-        if use_cache:
-            outputs += (present_key_value,)
+        outputs = context_layer
 
         return outputs
 
 
-LLAMA_START_DOCSTRING = r"""
-    This model inherits from [`PreTrainedModel`]. Check the superclass documentation for the generic methods the
-    library implements for all its model (such as downloading or saving, resizing the input embeddings, pruning heads
-    etc.)
-
-    This model is also a PyTorch [torch.nn.Module](https://pytorch.org/docs/stable/nn.html#torch.nn.Module) subclass.
-    Use it as a regular PyTorch Module and refer to the PyTorch documentation for all matter related to general usage
-    and behavior.
-
-    Parameters:
-        config ([`DiffMambaConfig`]):
-            Model configuration class with all the parameters of the model. Initializing with a config file does not
-            load the weights associated with the model, only the configuration. Check out the
-            [`~PreTrainedModel.from_pretrained`] method to load the model weights.
-"""
-
-
-@add_start_docstrings(
-    "The bare LLaMA Model outputting raw hidden-states without any specific head on top.",
-    LLAMA_START_DOCSTRING,
-)
 class DiffMambaPreTrainedModel(PreTrainedModel):
     config_class = DiffMambaConfig
     base_model_prefix = "model"
     supports_gradient_checkpointing = True
     _no_split_modules = ["DiffMambaDecoderLayer"]
     _skip_keys_device_placement = "past_key_values"
-    _supports_flash_attn_2 = True
 
     def _init_weights(self, module):
-        # std = self.config.initializer_range
-        # if isinstance(module, nn.Linear):
-        #     module.weight.data.normal_(mean=0.0, std=std)
-        #     if module.bias is not None:
-        #         module.bias.data.zero_()
-        # elif isinstance(module, nn.Embedding):
-        #     module.weight.data.normal_(mean=0.0, std=std)
-        #     if module.padding_idx is not None:
-        #         module.weight.data[module.padding_idx].zero_()
         return
 
 def create_block(
@@ -583,6 +262,7 @@ class DiffMambaModel(DiffMambaPreTrainedModel):
         super().__init__(config)
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
+        self.n_mamba_inversion = config.n_mamba_inversion
 
         self.embeddings = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
         self.input_proj = nn.Sequential(
@@ -612,6 +292,16 @@ class DiffMambaModel(DiffMambaPreTrainedModel):
                 for i in range(config.num_hidden_layers)
             ]
         )
+        self.cross_attention = config.cross_attention
+        print("cross_attention", config.cross_attention)
+        if config.cross_attention == True:
+            self.cross_attention_layers = nn.ModuleList(
+                nn.ModuleList([DiffMambaCrossAttention(config) for _ in range(config.num_hidden_layers)])
+            )
+            self.cross_attentions_norms = nn.ModuleList(
+                nn.ModuleList([DiffMambaRMSNorm(config.hidden_size, eps=config.rms_norm_eps) for _ in range(config.num_hidden_layers)])
+            )
+
         
         self.RMSNorm = DiffMambaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.norm = DiffMambaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -631,7 +321,7 @@ class DiffMambaModel(DiffMambaPreTrainedModel):
         self,
         input_embeds,
         timesteps,
-        attention_mask: Optional[torch.Tensor] = None,
+        encoder_hidden_states: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[List[torch.FloatTensor]] = None,
         use_cache: Optional[bool] = None,
@@ -687,15 +377,27 @@ class DiffMambaModel(DiffMambaPreTrainedModel):
         next_decoder_cache = () if use_cache else None
        
         residual = None
+        if self.cross_attention:
+            for i, (layer_forward, cross_attention, norm) in enumerate(zip(self.layers, self.cross_attention_layers, self.cross_attentions_norms)):
+                hidden_states, residual = layer_forward(
+                    hidden_states, residual, inference_params=None
+                )
 
-        for i, layer_forward in enumerate(self.layers):
-            hidden_states, residual = layer_forward(
-                hidden_states, residual, inference_params=None
-            )
+                residual = norm(hidden_states + residual).to(self.dtype)
+                hidden_states = cross_attention(residual, encoder_hidden_states)
 
-            if (i + 1) % 4 == 0 and (i+1) != len(self.layers):
-                hidden_states = torch.flip(hidden_states, dims=[1])
-                residual = torch.flip(residual, dims=[1])
+                if (i + 1) % self.n_mamba_inversion == 0 and (i+1) != len(self.layers):
+                    hidden_states = torch.flip(hidden_states, dims=[1])
+                    residual = torch.flip(residual, dims=[1])
+        else:
+            for i, layer_forward in enumerate(self.layers):
+                hidden_states, residual = layer_forward(
+                    hidden_states, residual, inference_params=None
+                )
+
+                if (i + 1) % self.n_mamba_inversion == 0 and (i+1) != len(self.layers):
+                    hidden_states = torch.flip(hidden_states, dims=[1])
+                    residual = torch.flip(residual, dims=[1])
 
 
         # add hidden states from the last decoder layer
@@ -770,7 +472,8 @@ class DiffMambaForDiffusionLM(DiffMambaPreTrainedModel):
         self,
         input_embeds,
         timesteps,
-        attention_mask: Optional[torch.Tensor] = None,
+        encoder_hidden_states: Optional[torch.Tensor] = None,
+        # attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[List[torch.FloatTensor]] = None,
         labels: Optional[torch.LongTensor] = None,
@@ -815,7 +518,8 @@ class DiffMambaForDiffusionLM(DiffMambaPreTrainedModel):
         outputs = self.model(
             input_embeds=input_embeds,
             timesteps=timesteps,
-            attention_mask=attention_mask,
+            encoder_hidden_states=encoder_hidden_states,
+            # attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_values=past_key_values,
             use_cache=use_cache,

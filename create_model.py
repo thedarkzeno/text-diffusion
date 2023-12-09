@@ -8,14 +8,14 @@ tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-2-7b-hf")
 
 timesteps = 1000
 scheduler = DDIMScheduler(
-  beta_end = 0.012,
-  beta_schedule = "scaled_linear",
-  beta_start = 0.00085,
-  clip_sample = False,
-#   skip_prk_steps = True,
-  set_alpha_to_one = False,
-  steps_offset = 1,
-#   interpolation_type = "linear",
+#   beta_end = 0.012,
+#   beta_schedule = "scaled_linear",
+#   beta_start = 0.00085,
+#   clip_sample = False,
+# #   skip_prk_steps = True,
+#   set_alpha_to_one = False,
+#   steps_offset = 1,
+# #   interpolation_type = "linear",
   prediction_type ="sample", 
   num_train_timesteps = timesteps
 )
@@ -35,4 +35,4 @@ model = DiffMambaForDiffusionLM(config)
 
 model.save_pretrained("models/diffMamba-mini-sample")
 tokenizer.save_pretrained("models/diffMamba-mini-sample")
-# scheduler.save_pretrained("models/diffMamba-mini-sample")
+scheduler.save_pretrained("models/diffMamba-mini-sample")
