@@ -43,7 +43,7 @@ from transformers.utils import ContextManagers
 from src.modeling_diffmamba import DiffMambaForDiffusionLM
 
 import diffusers
-from src.schedulers.ddpm import DDPMScheduler
+from diffusers import DDPMScheduler
 from diffusers.optimization import get_scheduler
 from diffusers.training_utils import EMAModel, compute_snr
 from diffusers.utils import deprecate, is_wandb_available, make_image_grid
@@ -88,6 +88,14 @@ def parse_args():
         ),
     )
     parser.add_argument(
+        "--train_file",
+        type=str,
+        default=None,
+        help=(
+            "Text file to train your model"
+        ),
+    )
+    parser.add_argument(
         "--dataset_config_name",
         type=str,
         default=None,
@@ -97,7 +105,7 @@ def parse_args():
         "--streaming",
         action="store_true",
         default=False,
-        help="Streaming the dataset"
+        help="Streaming the dataset",
     )
     parser.add_argument(
         "--train_data_dir",
@@ -114,6 +122,12 @@ def parse_args():
         type=str,
         default="Prompt",
         help="The column of the dataset containing a caption or a list of captions.",
+    )
+    parser.add_argument(
+        "--context_length",
+        type=int,
+        default=256,
+        help="The context size in terms of tokens.",
     )
     parser.add_argument(
         "--max_train_samples",
@@ -147,7 +161,7 @@ def parse_args():
     parser.add_argument(
         "--train_batch_size", type=int, default=16, help="Batch size (per device) for the training dataloader."
     )
-    parser.add_argument("--num_train_epochs", type=int, default=1000)
+    parser.add_argument("--num_train_epochs", type=int, default=10)
     parser.add_argument(
         "--max_train_steps",
         type=int,
@@ -323,8 +337,8 @@ def parse_args():
         args.local_rank = env_local_rank
 
     # Sanity checks
-    if args.dataset_name is None and args.train_data_dir is None:
-        raise ValueError("Need either a dataset name or a training folder.")
+    if args.dataset_name is None and args.train_data_dir is None and args.train_file is None:
+        raise ValueError("Need either a dataset name, training folder or training file.")
 
     # default to using the same revision for the non-ema model if not specified
     if args.non_ema_revision is None:
@@ -418,9 +432,13 @@ def main():
 
     model = DiffMambaForDiffusionLM.from_pretrained(
         args.pretrained_model_name_or_path,
+        cross_attention=True
         # use_flash_attention_2=True,
-        # torch_dtype=torch.float16
+        # torch_dtype=torch.bfloat16
     )
+    model.config.add_cross_attention=True
+    print(args.pretrained_model_name_or_path)
+    print(model.config)
 
     # Freeze vae and text_encoder and set model to trainable
     model.train()
@@ -515,14 +533,22 @@ def main():
     # download the dataset.
 
     # Downloading and loading a dataset from the hub.
-    dataset = load_dataset(
-        args.dataset_name,
-        args.dataset_config_name,
-        cache_dir=args.cache_dir,
-        data_dir=args.train_data_dir,
-        streaming=args.streaming,
-    )
-
+    if args.dataset_name is not None:
+        dataset = load_dataset(
+            args.dataset_name,
+            args.dataset_config_name,
+            cache_dir=args.cache_dir,
+            data_dir=args.train_data_dir,
+            streaming=args.streaming,
+        )
+    elif args.train_file is not None:
+        dataset = load_dataset(
+            "text",
+            data_files={"train": args.train_file},
+            cache_dir=args.cache_dir,
+        )
+    else:
+        raise ValueError("You should provide either dataset_name or train_file")
 
     # Preprocessing the datasets.
     # We need to tokenize inputs and targets.
@@ -532,7 +558,7 @@ def main():
     # dataset_columns = DATASET_NAME_MAPPING.get(args.dataset_name, None)
 
     if args.text_column is None:
-        text_column = column_names[0]
+        text_column = column_names[1]
     else:
         text_column = args.text_column
         if text_column not in column_names:
@@ -540,27 +566,43 @@ def main():
             raise ValueError(
                 f"--text_column' value '{args.text_column}' needs to be one of: {', '.join(column_names)}"
             )
+        
+
 
     # Preprocessing the datasets.
-    # We need to tokenize input captions and transform the images.
+    # We need to tokenize input texts and transform the images.
 
-    def tokenize_captions(examples, is_train=True):
-        captions = []
-        for caption in examples[text_column]:
-            if isinstance(caption, str):
-                captions.append(caption)
-            elif isinstance(caption, (list, np.ndarray)):
-                # take a random caption if there are multiple
-                captions.append(random.choice(caption) if is_train else caption[0])
+    def tokenize_text(examples, is_train=True):
+        
+
+        texts = []
+        for text in examples[text_column]:
+            if isinstance(text, str):
+                texts.append(text)
+            elif isinstance(text, (list, np.ndarray)):
+                # take a random text if there are multiple
+                texts.append(random.choice(text) if is_train else text[0])
             else:
                 raise ValueError(
-                    f"Caption column `{text_column}` should contain either strings or lists of strings."
+                    f"Text column `{text_column}` should contain either strings or lists of strings."
                 )
-        # print(captions)
+        
         inputs = tokenizer(
-            captions, max_length=64, padding="max_length", truncation=True, return_tensors="pt"
+            texts, padding=True, return_tensors="pt"
         )
-        return inputs.input_ids
+
+        max_len = min(2 *(inputs.input_ids.shape[1]//2), args.context_length)
+
+        inputs = tokenizer(
+            texts, max_length=max_len, padding="max_length", truncation=True, return_tensors="pt"
+        )
+
+        # Split input_ids into encoder_input_ids and decoder_input_ids
+        half_length = max_len//2
+        encoder_input_ids = inputs.input_ids[:, :half_length]
+        decoder_input_ids = inputs.input_ids[:, half_length:]
+
+        return encoder_input_ids, decoder_input_ids
 
 
     
@@ -571,20 +613,24 @@ def main():
         return vectors
 
     def preprocess_train(examples):
-        examples["input_ids"] = tokenize_captions(examples)
+        examples["encoder_input_ids"], examples["decoder_input_ids"] = tokenize_text(examples)
         return examples
 
     with accelerator.main_process_first():
+
+        dataset = dataset.filter(lambda example: tokenizer(example[args.text_column], return_tensors="pt").input_ids.shape[1] >= args.context_length,
+                                 num_proc=12)
+
         if args.max_train_samples is not None:
             dataset["train"] = dataset["train"].shuffle(seed=args.seed).select(range(args.max_train_samples))
         # Set the training transforms
         train_dataset = dataset["train"].with_transform(preprocess_train)
 
     def collate_fn(examples):
-        input_ids = torch.stack([example["input_ids"] for example in examples])
-        # one_hots = torch.stack([apply_embeddings(example["input_ids"]) for example in examples])
-        # one_hots = apply_embeddings(input_ids)
-        return {"input_ids": input_ids}
+        encoder_input_ids = torch.stack([example["encoder_input_ids"] for example in examples])
+        decoder_input_ids = torch.stack([example["decoder_input_ids"] for example in examples])
+
+        return {"encoder_input_ids": encoder_input_ids, "decoder_input_ids": decoder_input_ids}
     
 
     
@@ -709,14 +755,19 @@ def main():
         for step, batch in enumerate(train_dataloader):
             with accelerator.accumulate(model):
                 # Convert images to latent space
-                input_ids = batch["input_ids"].to(model.device)
+                encoder_input_ids = batch["encoder_input_ids"].to(model.device)
+                decoder_input_ids = batch["decoder_input_ids"].to(model.device)
+                # print(encoder_input_ids)
+                # print(decoder_input_ids)
+
 
                 max_steps = noise_scheduler.config.num_train_timesteps
-                bsz = input_ids.shape[0]
+                bsz = encoder_input_ids.shape[0]
                 timesteps = torch.randint(0, max_steps, (bsz,), device=model.device)
                 timesteps = timesteps.long()
 
-                latents = apply_embeddings(input_ids)
+                latents = apply_embeddings(decoder_input_ids)
+                encoder_latents = apply_embeddings(encoder_input_ids)
                 # print(latents.shape)
                 
                 noise = torch.randn_like(latents, requires_grad=False)
@@ -743,11 +794,11 @@ def main():
                     raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
 
                 # Predict the noise residual and compute loss
-                outputs = model(noisy_latents, timesteps=timesteps, labels=input_ids)
+                outputs = model(noisy_latents, timesteps=timesteps, labels=decoder_input_ids, encoder_hidden_states=encoder_latents)
                 nll_loss=outputs.loss
                 model_pred = outputs.last_hidden_state
 
-                ae_out = model.apply_lm_head(latents, labels=input_ids)
+                ae_out = model.apply_lm_head(latents, labels=decoder_input_ids)
 
                 ae_loss = ae_out.loss
 

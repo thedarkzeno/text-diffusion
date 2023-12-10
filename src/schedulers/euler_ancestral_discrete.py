@@ -80,7 +80,11 @@ def betas_for_alpha_bar(
 
         def alpha_bar_fn(t):
             return math.exp(t * -12.0)
-
+        
+    elif alpha_transform_type == "sqrt":
+        def alpha_bar_fn(t):
+            return 1 - np.sqrt(t + 0.0001)
+        
     else:
         raise ValueError(f"Unsupported alpha_tranform_type: {alpha_transform_type}")
 
@@ -91,6 +95,24 @@ def betas_for_alpha_bar(
         betas.append(min(1 - alpha_bar_fn(t2) / alpha_bar_fn(t1), max_beta))
     return torch.tensor(betas, dtype=torch.float32)
 
+def betas_for_alpha_bar_sqrt(num_diffusion_timesteps, alpha_bar, max_beta=0.999):
+    """
+    Create a beta schedule that discretizes the given alpha_t_bar function,
+    which defines the cumulative product of (1-beta) over time from t = [0,1].
+
+    :param num_diffusion_timesteps: the number of betas to produce.
+    :param alpha_bar: a lambda that takes an argument t from 0 to 1 and
+                      produces the cumulative product of (1-beta) up to that
+                      part of the diffusion process.
+    :param max_beta: the maximum beta to use; use values lower than 1 to
+                     prevent singularities.
+    """
+    betas = []
+    for i in range(num_diffusion_timesteps):
+        t1 = i / num_diffusion_timesteps
+        t2 = (i + 1) / num_diffusion_timesteps
+        betas.append(min(1 - alpha_bar(t2) / alpha_bar(t1), max_beta))
+    return np.array(betas)
 
 class EulerAncestralDiscreteScheduler(SchedulerMixin, ConfigMixin):
     """
@@ -133,9 +155,9 @@ class EulerAncestralDiscreteScheduler(SchedulerMixin, ConfigMixin):
         num_train_timesteps: int = 1000,
         beta_start: float = 0.0001,
         beta_end: float = 0.02,
-        beta_schedule: str = "linear",
+        beta_schedule: str = "sqrt",
         trained_betas: Optional[Union[np.ndarray, List[float]]] = None,
-        prediction_type: str = "epsilon",
+        prediction_type: str = "sample",
         timestep_spacing: str = "linspace",
         steps_offset: int = 0,
     ):
@@ -143,6 +165,11 @@ class EulerAncestralDiscreteScheduler(SchedulerMixin, ConfigMixin):
             self.betas = torch.tensor(trained_betas, dtype=torch.float32)
         elif beta_schedule == "linear":
             self.betas = torch.linspace(beta_start, beta_end, num_train_timesteps, dtype=torch.float32)
+        elif beta_schedule == "sqrt":
+            self.betas = betas_for_alpha_bar(
+            num_train_timesteps,
+            alpha_transform_type="sqrt",
+        )
         elif beta_schedule == "scaled_linear":
             # this schedule is very specific to the latent diffusion model.
             self.betas = (

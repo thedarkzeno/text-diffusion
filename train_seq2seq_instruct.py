@@ -424,7 +424,7 @@ def main():
 
     model = DiffMambaForDiffusionLM.from_pretrained(
         args.pretrained_model_name_or_path,
-        add_cross_attention=True
+        cross_attention=True
         # use_flash_attention_2=True,
         # torch_dtype=torch.bfloat16
     )
@@ -589,10 +589,10 @@ def main():
                 )
         # print(texts)
         instruction_inputs = tokenizer(
-            instructions, max_length=64, padding="max_length", truncation=True, return_tensors="pt"
+            instructions, max_length=512, padding="max_length", truncation=True, return_tensors="pt"
         )
         inputs = tokenizer(
-            texts, max_length=64, padding="max_length", truncation=True, return_tensors="pt"
+            texts, max_length=512, padding="max_length", truncation=True, return_tensors="pt"
         )
         return inputs.input_ids, instruction_inputs.input_ids
 

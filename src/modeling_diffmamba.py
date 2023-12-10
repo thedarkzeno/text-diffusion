@@ -302,7 +302,7 @@ class DiffMambaModel(DiffMambaPreTrainedModel):
                 nn.ModuleList([DiffMambaRMSNorm(config.hidden_size, eps=config.rms_norm_eps) for _ in range(config.num_hidden_layers)])
             )
 
-        
+        self.Last_layer_RMSNorm = DiffMambaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.RMSNorm = DiffMambaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.norm = DiffMambaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -398,7 +398,8 @@ class DiffMambaModel(DiffMambaPreTrainedModel):
                 if (i + 1) % self.n_mamba_inversion == 0 and (i+1) != len(self.layers):
                     hidden_states = torch.flip(hidden_states, dims=[1])
                     residual = torch.flip(residual, dims=[1])
-
+        
+        hidden_states = self.Last_layer_RMSNorm(hidden_states + residual).to(self.dtype)
 
         # add hidden states from the last decoder layer
         if output_hidden_states:
