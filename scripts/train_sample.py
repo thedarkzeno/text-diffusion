@@ -40,7 +40,7 @@ from tqdm.auto import tqdm
 from transformers import AutoTokenizer
 
 from transformers.utils import ContextManagers
-from src.modeling_diffmamba import DiffMambaForDiffusionLM
+from src.denoisers.modeling_diffmamba import DiffMambaForDiffusionLM
 
 import diffusers
 from src.schedulers.ddpm import DDPMScheduler

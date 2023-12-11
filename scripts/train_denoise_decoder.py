@@ -12,13 +12,21 @@
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
+import sys
+import os
+sys.path.append("..")
+
+current_dir = os.path.dirname(os.path.abspath(__file__))
+parent_dir = os.path.dirname(current_dir)
+sys.path.append(parent_dir)
 
 import argparse
 import logging
 import math
-import os
+
 import random
 import shutil
+import itertools
 from pathlib import Path
 
 import accelerate
@@ -40,10 +48,12 @@ from tqdm.auto import tqdm
 from transformers import AutoTokenizer
 
 from transformers.utils import ContextManagers
-from src.modeling_diffmamba import DiffMambaForDiffusionLM
+
+from src.denoisers.modeling_diffmamba import DiffMambaForDiffusionLM
+from src.schedulers.ddpm import DDPMScheduler
+from src.decoders.bert_decoder import BertLMHeadModel
 
 import diffusers
-from diffusers import DDPMScheduler
 from diffusers.optimization import get_scheduler
 from diffusers.training_utils import EMAModel, compute_snr
 from diffusers.utils import deprecate, is_wandb_available, make_image_grid
@@ -425,23 +435,29 @@ def main():
             ).repo_id
 
     # Load scheduler, tokenizer and models.
-    noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path)
+    noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
+
     tokenizer = AutoTokenizer.from_pretrained(
-        args.pretrained_model_name_or_path, revision=args.revision
+        args.pretrained_model_name_or_path, revision=args.revision, subfolder="tokenizer"
     )
 
     model = DiffMambaForDiffusionLM.from_pretrained(
         args.pretrained_model_name_or_path,
-        cross_attention=True
+        subfolder="denoiser"
         # use_flash_attention_2=True,
         # torch_dtype=torch.bfloat16
     )
-    model.config.add_cross_attention=True
-    print(args.pretrained_model_name_or_path)
+
+    decoder = BertLMHeadModel.from_pretrained(
+        args.pretrained_model_name_or_path,
+        subfolder="decoder"
+    )
+    
     print(model.config)
 
     # Freeze vae and text_encoder and set model to trainable
     model.train()
+    decoder.train()
 
 
     # Create EMA for the model.
@@ -456,6 +472,7 @@ def main():
     embedding_size = model.get_input_embeddings().weight.shape[0]
     if len(tokenizer) > embedding_size:
         model.resize_token_embeddings(len(tokenizer))
+        decoder.resize_token_embeddings(len(tokenizer))
 
     # `accelerate` 0.16.0 will have better support for customized saving
     if version.parse(accelerate.__version__) >= version.parse("0.16.0"):
@@ -518,8 +535,12 @@ def main():
     else:
         optimizer_cls = torch.optim.AdamW
 
+    params_to_optimize = (
+        itertools.chain(model.parameters(), decoder.parameters())
+    )
+
     optimizer = optimizer_cls(
-        model.parameters(),
+        params_to_optimize,
         lr=args.learning_rate,
         betas=(args.adam_beta1, args.adam_beta2),
         weight_decay=args.adam_weight_decay,
@@ -587,22 +608,14 @@ def main():
                     f"Text column `{text_column}` should contain either strings or lists of strings."
                 )
         
-        inputs = tokenizer(
-            texts, padding=True, return_tensors="pt"
-        )
-
-        max_len = min(2 *(inputs.input_ids.shape[1]//2), args.context_length)
 
         inputs = tokenizer(
-            texts, max_length=max_len, padding="max_length", truncation=True, return_tensors="pt"
+            texts, max_length=args.context_length, padding="max_length", truncation=True, return_tensors="pt"
         )
 
-        # Split input_ids into encoder_input_ids and decoder_input_ids
-        half_length = max_len//2
-        encoder_input_ids = inputs.input_ids[:, :half_length]
-        decoder_input_ids = inputs.input_ids[:, half_length:]
 
-        return encoder_input_ids, decoder_input_ids
+
+        return inputs.input_ids
 
 
     
@@ -613,13 +626,10 @@ def main():
         return vectors
 
     def preprocess_train(examples):
-        examples["encoder_input_ids"], examples["decoder_input_ids"] = tokenize_text(examples)
+        examples["input_ids"] = tokenize_text(examples)
         return examples
 
     with accelerator.main_process_first():
-
-        dataset = dataset.filter(lambda example: tokenizer(example[args.text_column], return_tensors="pt").input_ids.shape[1] >= args.context_length,
-                                 num_proc=12)
 
         if args.max_train_samples is not None:
             dataset["train"] = dataset["train"].shuffle(seed=args.seed).select(range(args.max_train_samples))
@@ -627,10 +637,8 @@ def main():
         train_dataset = dataset["train"].with_transform(preprocess_train)
 
     def collate_fn(examples):
-        encoder_input_ids = torch.stack([example["encoder_input_ids"] for example in examples])
-        decoder_input_ids = torch.stack([example["decoder_input_ids"] for example in examples])
-
-        return {"encoder_input_ids": encoder_input_ids, "decoder_input_ids": decoder_input_ids}
+        input_ids = torch.stack([example["input_ids"] for example in examples])
+        return {"input_ids": input_ids}
     
 
     
@@ -658,8 +666,8 @@ def main():
     )
 
     # Prepare everything with our `accelerator`.
-    model, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-        model, optimizer, train_dataloader, lr_scheduler
+    model, decoder, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+        model, decoder, optimizer, train_dataloader, lr_scheduler
     )
 
     if args.use_ema:
@@ -755,19 +763,14 @@ def main():
         for step, batch in enumerate(train_dataloader):
             with accelerator.accumulate(model):
                 # Convert images to latent space
-                encoder_input_ids = batch["encoder_input_ids"].to(model.device)
-                decoder_input_ids = batch["decoder_input_ids"].to(model.device)
-                # print(encoder_input_ids)
-                # print(decoder_input_ids)
-
-
+                input_ids = batch["input_ids"].to(model.device)
+                
                 max_steps = noise_scheduler.config.num_train_timesteps
-                bsz = encoder_input_ids.shape[0]
+                bsz = input_ids.shape[0]
                 timesteps = torch.randint(0, max_steps, (bsz,), device=model.device)
                 timesteps = timesteps.long()
 
-                latents = apply_embeddings(decoder_input_ids)
-                encoder_latents = apply_embeddings(encoder_input_ids)
+                latents = apply_embeddings(input_ids)
                 # print(latents.shape)
                 
                 noise = torch.randn_like(latents, requires_grad=False)
@@ -794,11 +797,21 @@ def main():
                     raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
 
                 # Predict the noise residual and compute loss
-                outputs = model(noisy_latents, timesteps=timesteps, labels=decoder_input_ids, encoder_hidden_states=encoder_latents)
+                outputs = model(noisy_latents, timesteps=timesteps, labels=input_ids)
+                
                 nll_loss=outputs.loss
+                
                 model_pred = outputs.last_hidden_state
-
-                ae_out = model.apply_lm_head(latents, labels=decoder_input_ids)
+                
+                decoder_outputs = decoder(input_ids=input_ids, labels=input_ids, encoder_hidden_states=model_pred)
+                
+                decoder_loss = decoder_outputs.loss
+                
+                decoder_mse_loss = F.mse_loss(decoder_outputs.hidden_states.float(), target.float(), reduction="mean")
+                ae_out = model.apply_lm_head(latents, labels=input_ids)
+                
+                #implement loss for passing un-noised latents through decoder lm head
+                # ae_decoder_out = decoder.get_output_embeddings()()
 
                 ae_loss = ae_out.loss
 
@@ -812,10 +825,7 @@ def main():
                     # )
                     # tT_loss = mean_flat(out_mean**2).mean()
                     # print(tT_loss)
-                    if step < 100:
-                        loss = ae_loss
-                    else:
-                        loss = nll_loss + mse_loss + ae_loss# + tT_loss
+                    loss = decoder_loss + mse_loss + decoder_mse_loss + ae_loss# + tT_loss
                 else:
                     # Compute loss-weights as per Section 3.4 of https://arxiv.org/abs/2303.09556.
                     # Since we predict the noise instead of x_0, the original formulation is slightly changed.
@@ -833,10 +843,9 @@ def main():
                     mse_loss = mse_loss.mean(dim=list(range(1, len(mse_loss.shape)))) * mse_loss_weights
                     mse_loss = mse_loss.mean()
                     # mean_zero_loss = mean_zero_loss_function(model_pred.float())
-                    if step < 100:
-                        loss = ae_loss
-                    else:
-                        loss = nll_loss + mse_loss + ae_loss
+                    
+                    
+                    loss = decoder_loss + mse_loss + decoder_mse_loss + ae_loss
 
                 # Gather the losses across all processes for logging (if we use distributed training).
                 avg_loss = accelerator.gather(loss.repeat(args.train_batch_size)).mean()
@@ -862,18 +871,23 @@ def main():
                 if global_step % args.checkpointing_steps == 0:
                     if accelerator.is_main_process:
                         model = accelerator.unwrap_model(model)
+                        decoder = accelerator.unwrap_model(decoder)
                         if args.use_ema:
                             ema_model.copy_to(model.parameters())
 
-                        model.save_pretrained(args.output_dir)
+                        model.save_pretrained(os.path.join(args.output_dir, "denoiser"))
+                        decoder.save_pretrained(os.path.join(args.output_dir, "decoder"))
+                        tokenizer.save_pretrained(os.path.join(args.output_dir, "tokenizer"))
+                        noise_scheduler.save_pretrained(os.path.join(args.output_dir, "scheduler"))
 
 
             logs = {"loss": loss.detach().item(), 
                     "mse_loss": mse_loss.detach().item(), 
-                    "nll_loss": nll_loss.detach().item(), 
+                    "decoder_mse_loss": decoder_mse_loss.detach().item(), 
                     # "mz_loss": mean_zero_loss.detach().item(), 
-                    "ae_loss": ae_loss.detach().item(), 
-                    "lr": lr_scheduler.get_last_lr()[0]}
+                    "decoder_loss": decoder_loss.detach().item(), 
+                    # "lr": lr_scheduler.get_last_lr()[0]
+                    }
             progress_bar.set_postfix(**logs)
 
             if global_step >= args.max_train_steps:
@@ -885,10 +899,14 @@ def main():
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
         model = accelerator.unwrap_model(model)
+        decoder = accelerator.unwrap_model(decoder)
         if args.use_ema:
             ema_model.copy_to(model.parameters())
 
-        model.save_pretrained(args.output_dir)
+        model.save_pretrained(os.path.join(args.output_dir, "denoiser"))
+        decoder.save_pretrained(os.path.join(args.output_dir, "decoder"))
+        tokenizer.save_pretrained(os.path.join(args.output_dir, "tokenizer"))
+        noise_scheduler.save_pretrained(os.path.join(args.output_dir, "scheduler"))
 
     accelerator.end_training()
 
