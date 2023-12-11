@@ -41,7 +41,7 @@ from transformers.utils import (
     replace_return_docstrings,
 )
 from transformers.utils.import_utils import is_torch_fx_available
-from src.configuration_diffmamba import DiffMambaConfig
+from src.denoisers.configuration_diffmamba import DiffMambaConfig
 from mamba_ssm.modules.mamba_simple import Mamba, Block
 
 try:

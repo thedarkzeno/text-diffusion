@@ -1,21 +1,14 @@
 # from modeling_diffbert_sample import DiffBertForDiffusion, DiffBertConfig
-from src.modeling_diffmamba import DiffMambaForDiffusionLM, DiffMambaConfig
-from transformers import AutoTokenizer
+from src.denoisers.modeling_diffmamba import DiffMambaForDiffusionLM, DiffMambaConfig
+from transformers import AutoTokenizer, BertLMHeadModel, BertConfig
 from src.schedulers.ddpm import DDPMScheduler
 import torch
 
 tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-2-7b-hf")
 
-timesteps = 2000
+timesteps = 1200
 scheduler = DDPMScheduler(
-#   beta_end = 0.012,
   beta_schedule = "sqrt",
-#   beta_start = 0.00085,
-#   clip_sample = False,
-# #   skip_prk_steps = True,
-#   set_alpha_to_one = False,
-#   steps_offset = 1,
-# #   interpolation_type = "linear",
   prediction_type ="sample", 
   num_train_timesteps = timesteps
 )
@@ -31,8 +24,21 @@ config = DiffMambaConfig(
         torch_dtype=torch.float16
     )
 
-model = DiffMambaForDiffusionLM(config)
+decoder_config = BertConfig(
+        hidden_size=768,
+        num_hidden_layers=6,
+        num_attention_heads=12,
+        intermediate_size=3072,
+        vocab_size=tokenizer.vocab_size, 
+        is_decoder=True,
+        add_cross_attention=True,
+        torch_dtype=torch.float16
+    )
 
-model.save_pretrained("models/diffMamba-mini-sample")
-tokenizer.save_pretrained("models/diffMamba-mini-sample")
-scheduler.save_pretrained("models/diffMamba-mini-sample")
+model = DiffMambaForDiffusionLM(config)
+decoder = BertLMHeadModel(decoder_config)
+
+model.save_pretrained("models/diffMamba-mini-sample/denoiser")
+tokenizer.save_pretrained("models/diffMamba-mini-sample/tokenizer")
+scheduler.save_pretrained("models/diffMamba-mini-sample/scheduler")
+decoder.save_pretrained("models/diffMamba-mini-sample/decoder")
