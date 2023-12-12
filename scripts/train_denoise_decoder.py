@@ -825,7 +825,7 @@ def main():
                     # )
                     # tT_loss = mean_flat(out_mean**2).mean()
                     # print(tT_loss)
-                    loss = decoder_loss + mse_loss + decoder_mse_loss + ae_loss# + tT_loss
+                    loss = nll_loss + decoder_loss + mse_loss + decoder_mse_loss + ae_loss# + tT_loss
                 else:
                     # Compute loss-weights as per Section 3.4 of https://arxiv.org/abs/2303.09556.
                     # Since we predict the noise instead of x_0, the original formulation is slightly changed.
@@ -845,7 +845,7 @@ def main():
                     # mean_zero_loss = mean_zero_loss_function(model_pred.float())
                     
                     
-                    loss = decoder_loss + mse_loss + decoder_mse_loss + ae_loss
+                    loss = nll_loss + decoder_loss + mse_loss + decoder_mse_loss + ae_loss
 
                 # Gather the losses across all processes for logging (if we use distributed training).
                 avg_loss = accelerator.gather(loss.repeat(args.train_batch_size)).mean()

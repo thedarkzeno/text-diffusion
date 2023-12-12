@@ -1264,7 +1264,7 @@ class BertLMHeadModel(BertPreTrainedModel):
         )
 
     def prepare_inputs_for_generation(
-        self, input_ids, past_key_values=None, attention_mask=None, use_cache=True, **model_kwargs
+        self, input_ids, past_key_values=None, attention_mask=None, use_cache=True, encoder_hidden_states=None, **model_kwargs
     ):
         input_shape = input_ids.shape
         # if model is used as a decoder in encoder-decoder model, the decoder attention mask is created on the fly
@@ -1289,6 +1289,7 @@ class BertLMHeadModel(BertPreTrainedModel):
             "attention_mask": attention_mask,
             "past_key_values": past_key_values,
             "use_cache": use_cache,
+            "encoder_hidden_states": encoder_hidden_states
         }
 
     def _reorder_cache(self, past_key_values, beam_idx):
